@@ -8,13 +8,18 @@ Routes:
   GET  /jobs/<id>/file/<kind>/<name>   serve anchor/clip/output files
 """
 import os
+import sys
 import threading
+
+# Allow running as `python app.py` from inside the backend directory
+if __name__ == "__main__":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
-
-from . import config, jobs
-from .models.schemas import Job, new_id
-from .pipeline import detect, analyze, generate, critic, splice
+from backend import config, jobs
+from backend.models.schemas import Job, new_id
+from backend.pipeline import detect, analyze, generate, critic, splice
 
 app = Flask(__name__)
 CORS(app)
@@ -43,7 +48,7 @@ def _process(job_id: str):
             ctx = slot_contexts[slot.id]
             if ctx.recommendation == "cut":
                 cut_insert = new_id()
-                from .models.schemas import Insert
+                from backend.models.schemas import Insert
                 job.inserts.append(Insert(
                     id=cut_insert,
                     slot_id=slot.id,
