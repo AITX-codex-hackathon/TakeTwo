@@ -16,8 +16,8 @@ CACHE = DATA / "cache"
 for d in (UPLOADS, CLIPS, OUTPUTS, FRAMES, CACHE):
     d.mkdir(parents=True, exist_ok=True)
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-VLM_MODEL = os.getenv("VLM_MODEL", "gemini-2.5-flash")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+VLM_MODEL = os.getenv("VLM_MODEL", "gpt-4o")
 
 I2V_PROVIDER = os.getenv("I2V_PROVIDER", "stub")
 LUMA_API_KEY = os.getenv("LUMA_API_KEY", "")

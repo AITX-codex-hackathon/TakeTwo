@@ -1,33 +1,26 @@
 """
-Stage 4: Quality critic using Gemini.
-Compares original bad frame vs generated replacement — checks if it's actually better.
+Stage 4: Quality critic using GPT-4o.
+Compares original bad frame vs generated replacement.
 """
 import json
+import base64
 import cv2
 import os
 from ..models.schemas import Insert
 from .. import config
 
 
-PROMPT = """
-You are a video quality critic. You'll see two images:
-  IMAGE A: a frame from the ORIGINAL clip that was flagged as bad quality
-  IMAGE B: first frame of an AI-GENERATED replacement clip
+PROMPT = """You are a video quality critic comparing two frames.
+  IMAGE A: original clip flagged as bad quality
+  IMAGE B: AI-generated cinematic replacement
 
-The original was flagged for: {issues}
+Original was flagged for: {issues}
 
-Evaluate whether the replacement is an improvement. Return JSON:
-{{
-  "better_quality": true/false,
-  "maintains_scene": true/false,
-  "artifacts": true/false,
-  "natural_looking": true/false,
-  "pass": true/false,
-  "notes": "short explanation"
-}}
+Return JSON:
+{{"better_quality": true/false, "maintains_scene": true/false, "artifacts": true/false,
+  "natural_looking": true/false, "pass": true/false, "notes": "short explanation"}}
 
-"pass" = true means IMAGE B is a clear improvement over IMAGE A and safe to use.
-"""
+"pass" = true means IMAGE B is a clear improvement and safe to use."""
 
 
 def _first_frame(clip_path: str, out_path: str) -> str:
@@ -45,31 +38,35 @@ def review(insert: Insert, anchor_path: str, issues: list) -> Insert:
     _first_frame(insert.clip_path, first_path)
 
     issues_str = ", ".join(issues) if issues else "general quality"
-    print(f"[critic] calling Gemini to compare original vs replacement, issues={issues_str}", flush=True)
+    print(f"[critic] calling GPT-4o to compare frames, issues={issues_str}", flush=True)
 
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
     try:
-        client = genai.Client(api_key=config.GOOGLE_API_KEY)
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
         with open(anchor_path, "rb") as f:
-            anchor_bytes = f.read()
+            b64_a = base64.b64encode(f.read()).decode()
         with open(first_path, "rb") as f:
-            gen_bytes = f.read()
-        resp = client.models.generate_content(
+            b64_b = base64.b64encode(f.read()).decode()
+        resp = client.chat.completions.create(
             model=config.VLM_MODEL,
-            contents=[
-                PROMPT.format(issues=issues_str),
-                "Image A (original bad frame):",
-                types.Part.from_bytes(data=anchor_bytes, mime_type="image/png"),
-                "Image B (generated replacement):",
-                types.Part.from_bytes(data=gen_bytes, mime_type="image/png"),
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT.format(issues=issues_str)},
+                    {"type": "text", "text": "Image A (original bad frame):"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_a}", "detail": "low"}},
+                    {"type": "text", "text": "Image B (AI replacement):"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_b}", "detail": "low"}},
+                ],
+            }],
+            max_tokens=300,
+            temperature=0,
         )
-        text = resp.text.replace("```json", "").replace("```", "").strip()
+        text = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
         d = json.loads(text)
-        print(f"[critic] Gemini: pass={d.get('pass')} notes={d.get('notes')}", flush=True)
+        print(f"[critic] GPT-4o: pass={d.get('pass')} — {d.get('notes')}", flush=True)
     except Exception as e:
-        print(f"[critic] ERROR: Gemini call failed: {e}", flush=True)
+        print(f"[critic] ERROR: {e}", flush=True)
         d = {"pass": False, "notes": f"critic error: {e}"}
 
     insert.critic_pass = bool(d.get("pass", False))

@@ -1,21 +1,20 @@
 """
-Stage 1: Find 1-2 timestamps for cinematic enhancement.
-Sends all sampled frames to Gemini in ONE call (not one per frame).
-Caches results per video so pipeline restarts skip re-analysis.
+Stage 1: Find 1-2 timestamps for cinematic enhancement using GPT-4o.
+Sends all sampled frames in ONE call. Caches results per video.
 """
 import os
 import json
+import base64
 import hashlib
 import time
 import shutil
 import subprocess
 import tempfile
-import re
 from typing import List
 from ..models.schemas import Slot, new_id
 from .. import config
 
-SAMPLE_INTERVAL = 10.0  # sample one frame every 10 seconds
+SAMPLE_INTERVAL = 10.0
 
 
 def _video_hash(path: str) -> str:
@@ -27,9 +26,7 @@ def _video_hash(path: str) -> str:
 
 
 def _cache_path(video_path: str) -> str:
-    cache_dir = config.DATA / "cache"
-    cache_dir.mkdir(exist_ok=True)
-    return str(cache_dir / f"{_video_hash(video_path)}_detect.json")
+    return str(config.CACHE / f"{_video_hash(video_path)}_detect.json")
 
 
 def _ffprobe(video_path: str) -> dict:
@@ -77,64 +74,57 @@ def extract_clip(video_path: str, start_frame: int, end_frame: int, out_path: st
     return out_path
 
 
-def _gemini_find_worst(video_path: str, timestamps: List[float]) -> List[dict]:
-    """One Gemini call with all frames. Returns 1-2 worst timestamp dicts."""
-    from google import genai
-    from google.genai import types
+def _b64_frame(video_path: str, timestamp: float) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+    _extract_frame(video_path, timestamp, tmp_path)
+    with open(tmp_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    os.unlink(tmp_path)
+    return data
 
-    client = genai.Client(api_key=config.GOOGLE_API_KEY)
 
-    prompt = (
-        f"You are reviewing {len(timestamps)} frames sampled from a video "
-        f"(one frame every {SAMPLE_INTERVAL:.0f} seconds, labeled Frame 0 to Frame {len(timestamps)-1}).\n\n"
-        "Pick the 1-2 moments that most need improvement — either bad quality (blurry, dark, shaky, noisy) "
-        "OR dull/boring shots where a cinematic AI-generated replacement would most enhance the video.\n\n"
-        "Return ONLY a JSON array (1-2 entries), worst first:\n"
-        '[\n'
-        '  {\n'
-        '    "frame_index": <0-based int>,\n'
-        '    "timestamp": <float seconds>,\n'
-        '    "quality_score": <float 0.0-1.0, lower=worse>,\n'
-        '    "issues": ["blurry"|"shaky"|"overexposed"|"underexposed"|"low contrast"|"noisy"|"boring"],\n'
-        '    "reason": "one sentence"\n'
-        '  }\n'
-        ']'
+def _gpt_find_worst(video_path: str, timestamps: List[float]) -> List[dict]:
+    from openai import OpenAI
+    client = OpenAI(api_key=config.OPENAI_API_KEY)
+
+    print(f"[detect] extracting {len(timestamps)} frames for GPT-4o batch analysis...", flush=True)
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                f"You are reviewing {len(timestamps)} frames sampled from a video "
+                f"(one every {SAMPLE_INTERVAL:.0f}s, labeled Frame 0 to Frame {len(timestamps)-1}).\n\n"
+                "Pick the 1-2 moments that most need improvement — bad quality (blurry, dark, shaky, noisy) "
+                "OR dull/boring shots where a cinematic AI replacement would most enhance the video.\n\n"
+                "Return ONLY a JSON array (1-2 entries), worst first:\n"
+                '[{"frame_index": 0, "timestamp": 5.0, "quality_score": 0.3, '
+                '"issues": ["blurry","underexposed"], "reason": "one sentence"}]'
+            )
+        }
+    ]
+
+    for i, ts in enumerate(timestamps):
+        b64 = _b64_frame(video_path, ts)
+        content.append({"type": "text", "text": f"Frame {i} ({ts:.1f}s):"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}})
+
+    print(f"[detect] sending {len(timestamps)} frames to GPT-4o in ONE call...", flush=True)
+    resp = client.chat.completions.create(
+        model=config.VLM_MODEL,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=512,
+        temperature=0,
     )
-
-    with tempfile.TemporaryDirectory() as tmp:
-        contents = [prompt]
-        for i, ts in enumerate(timestamps):
-            frame_path = os.path.join(tmp, f"frame_{i:04d}.jpg")
-            _extract_frame(video_path, ts, frame_path)
-            with open(frame_path, "rb") as f:
-                img_bytes = f.read()
-            contents.append(f"Frame {i} ({ts:.1f}s):")
-            contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
-
-        print(f"[detect] sending {len(timestamps)} frames to Gemini in ONE call...", flush=True)
-
-        for attempt in range(4):
-            try:
-                resp = client.models.generate_content(model=config.VLM_MODEL, contents=contents)
-                text = resp.text.replace("```json", "").replace("```", "").strip()
-                result = json.loads(text)
-                if isinstance(result, dict):
-                    result = [result]
-                print(f"[detect] Gemini picked {len(result)} moment(s) for replacement:", flush=True)
-                for r in result:
-                    print(f"[detect]   {r['timestamp']:.1f}s — {r.get('reason', '')} (score={r.get('quality_score')})", flush=True)
-                return result[:2]
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    match = re.search(r"retryDelay.*?(\d+)s", err)
-                    wait = int(match.group(1)) + 2 if match else 60
-                    print(f"[detect] rate limited — waiting {wait}s (attempt {attempt+1}/4)...", flush=True)
-                    time.sleep(wait)
-                else:
-                    print(f"[detect] ERROR: {e}", flush=True)
-                    raise
-        raise RuntimeError("Gemini rate limit: exceeded retries")
+    text = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    result = json.loads(text)
+    if isinstance(result, dict):
+        result = [result]
+    print(f"[detect] GPT-4o picked {len(result)} moment(s):", flush=True)
+    for r in result:
+        print(f"[detect]   {r['timestamp']:.1f}s — {r.get('reason', '')} (score={r.get('quality_score')})", flush=True)
+    return result[:2]
 
 
 def find_bad_clips(video_path: str) -> List[Slot]:
@@ -152,28 +142,25 @@ def find_bad_clips(video_path: str) -> List[Slot]:
         timestamps.append(t)
         t += SAMPLE_INTERVAL
 
-    # Load or compute Gemini assessment (cached per video file)
     cache_file = _cache_path(video_path)
     if os.path.exists(cache_file):
-        print(f"[detect] using cached Gemini results (skipping API call)", flush=True)
+        print(f"[detect] using cached results (skipping API call)", flush=True)
         with open(cache_file) as f:
             candidates = json.load(f)
     else:
         print(f"[detect] video={duration:.1f}s, sampling {len(timestamps)} frames every {SAMPLE_INTERVAL}s", flush=True)
-        candidates = _gemini_find_worst(video_path, timestamps)
+        candidates = _gpt_find_worst(video_path, timestamps)
         with open(cache_file, "w") as f:
             json.dump(candidates, f)
         print(f"[detect] cached to {cache_file}", flush=True)
 
-    clip_half = 2.5  # center a 5-sec window around each bad timestamp
+    clip_half = 2.5
     slots = []
     for c in candidates:
         ts = float(c["timestamp"])
         start_ts = max(0.0, ts - clip_half)
         end_ts = min(duration, ts + clip_half)
-
         if end_ts - start_ts < 2.0:
-            print(f"[detect] skipping {ts:.1f}s — too close to edge", flush=True)
             continue
 
         start_frame = int(start_ts * fps)
@@ -189,7 +176,7 @@ def find_bad_clips(video_path: str) -> List[Slot]:
             extract_anchor(video_path, mid_frame, anchor_path, fps)
             extract_clip(video_path, start_frame, end_frame, clip_path, fps)
         except Exception as e:
-            print(f"[detect] failed to extract slot at {ts:.1f}s: {e}", flush=True)
+            print(f"[detect] failed to extract slot: {e}", flush=True)
             continue
 
         slots.append(Slot(
@@ -203,5 +190,5 @@ def find_bad_clips(video_path: str) -> List[Slot]:
         ))
         print(f"[detect] slot {sid[:8]}: {ts:.1f}s — {c.get('reason', '')}", flush=True)
 
-    print(f"[detect] found {len(slots)} slot(s) for cinematic replacement", flush=True)
+    print(f"[detect] found {len(slots)} slot(s)", flush=True)
     return slots
