@@ -37,6 +37,8 @@ class SceneContext:
     mood: str
     replacement_prompts: List[str] = field(default_factory=list)
     recommendation: Literal["replace", "cut"] = "replace"
+    negative_prompt: str = ""
+    motion_directive: str = ""
 
     @classmethod
     def from_dict(cls, d: dict) -> "SceneContext":
@@ -46,6 +48,8 @@ class SceneContext:
             mood=d["mood"],
             replacement_prompts=d.get("replacement_prompts", []),
             recommendation=d.get("recommendation", "replace"),
+            negative_prompt=d.get("negative_prompt", ""),
+            motion_directive=d.get("motion_directive", ""),
         )
 
 
@@ -86,6 +90,7 @@ class Job:
     output_path: Optional[str] = None
     error: Optional[str] = None
     logs: list = field(default_factory=list)
+    video_meta: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
@@ -99,6 +104,7 @@ class Job:
             output_path=d.get("output_path"),
             error=d.get("error"),
             logs=d.get("logs", []),
+            video_meta=d.get("video_meta", {}),
         )
         job.slots = [Slot.from_dict(s) for s in d.get("slots", [])]
         job.inserts = [Insert.from_dict(i) for i in d.get("inserts", [])]
