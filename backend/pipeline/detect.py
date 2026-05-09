@@ -1,26 +1,35 @@
 """
-Stage 1: Two-pass video analysis.
-  Pass 1 (meta)  — 8 evenly-spaced frames → GPT-4o → understand video type, style, palette
-  Pass 2 (detect)— all sampled frames + meta context → GPT-4o → find up to MAX_BAD_CLIPS moments
+Stage 1: Two-pass video analysis + scene transition detection.
+  Pass 1 (meta)     — 8 evenly-spaced frames → GPT-4o → understand video type, style, palette
+  Pass 2 (detect)   — all sampled frames + meta context → GPT-4o → find up to MAX_BAD_CLIPS moments
+  Pass 3 (handover) — per-slot: detect next hard cut, estimate incoming camera motion
+                      → populates Slot.replace_end_frame and Slot.transition
+
 Results cached by video MD5.  Returns (List[Slot], video_meta_dict).
 """
 import os
+import re
 import json
 import base64
 import hashlib
 import shutil
 import subprocess
 import tempfile
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
-from ..models.schemas import Slot, new_id
+from ..models.schemas import Slot, SceneTransition, new_id
 from .. import config
 from .api_utils import retry_api, parse_json
 
-# Sample every 5s for videos < 5 min, every 10s for longer ones
 INTERVAL_SHORT = 5.0
 INTERVAL_LONG  = 10.0
-META_FRAMES    = 8      # frames sent in the meta pass
+META_FRAMES    = 8
+# Look for a hard cut up to this many seconds after the slot's end frame
+NEXT_CUT_SEARCH_WINDOW = 10.0
+# Only extend replacement if next cut is beyond slot end AND within this many seconds
+MAX_EXTENSION_S = 8.0
+# Scene change sensitivity — 0.35 catches most hard cuts without false positives on camera moves
+SCENE_THRESHOLD = 0.35
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -34,7 +43,6 @@ def _video_hash(path: str) -> str:
 
 
 def _cache_path(video_path: str) -> str:
-    # _v2 suffix so old single-list caches are ignored
     return str(config.CACHE / f"{_video_hash(video_path)}_detect_v2.json")
 
 
@@ -93,6 +101,117 @@ def extract_clip(video_path: str, start_frame: int, end_frame: int,
         "-an", "-movflags", "+faststart", out_path,
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_path
+
+
+# ─── scene transition detection ─────────────────────────────────────────────
+
+def _detect_next_cut(video_path: str, search_start_ts: float,
+                     search_window: float = NEXT_CUT_SEARCH_WINDOW) -> float:
+    """
+    Find the next hard cut after search_start_ts using ffmpeg scene detection.
+    Returns the absolute timestamp of the first detected cut, or -1.0 if none.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return -1.0
+    try:
+        cmd = [
+            ffmpeg,
+            "-ss", f"{search_start_ts:.3f}",
+            "-t",  f"{search_window:.1f}",
+            "-i",  video_path,
+            "-vf", f"select=gt(scene\\,{SCENE_THRESHOLD}),showinfo",
+            "-vsync", "vfr", "-f", "null", "-",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # showinfo writes lines like: "pts_time:1.234" to stderr
+        matches = re.findall(r'pts_time:([\d.]+)', result.stderr)
+        if matches:
+            offset = float(matches[0])
+            # Skip cuts within the first 0.5s — those are in our slot window
+            if offset > 0.5:
+                return search_start_ts + offset
+    except Exception as e:
+        print(f"[detect/cut] scene detection failed: {e}", flush=True)
+    return -1.0
+
+
+def _estimate_motion_type(video_path: str, slot_start_ts: float,
+                          fps: float) -> Tuple[str, float]:
+    """
+    Extract 6 frames before slot_start_ts and use phase correlation to classify
+    incoming camera motion. Returns (motion_type, speed_px_per_frame).
+
+    Phase correlation shift convention (cv2.phaseCorrelate returns shift of img2 vs img1):
+      dx < 0  → objects moved left → camera panned right
+      dx > 0  → objects moved right → camera panned left
+      dy > 0  → objects moved down → camera tilted up
+      dy < 0  → objects moved up → camera tilted down
+    """
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return "static", 0.0
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return "static", 0.0
+
+    n = 6
+    interval = 0.15  # seconds between sampled frames
+    timestamps = [max(0.0, slot_start_ts - (n - i) * interval) for i in range(n)]
+
+    frames = []
+    for ts in timestamps:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            subprocess.run([
+                ffmpeg, "-y", "-ss", f"{ts:.3f}", "-i", video_path,
+                "-frames:v", "1", "-q:v", "5", tmp_path,
+            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            img = cv2.imread(tmp_path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                # Downscale for speed; phase correlation is resolution-independent
+                frames.append(cv2.resize(img, (320, 180)).astype(np.float64))
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    if len(frames) < 2:
+        return "static", 0.0
+
+    shifts = []
+    for i in range(len(frames) - 1):
+        try:
+            shift, _response = cv2.phaseCorrelate(frames[i], frames[i + 1])
+            shifts.append(shift)
+        except Exception:
+            pass
+
+    if not shifts:
+        return "static", 0.0
+
+    avg_dx = sum(s[0] for s in shifts) / len(shifts)
+    avg_dy = sum(s[1] for s in shifts) / len(shifts)
+    speed  = (avg_dx ** 2 + avg_dy ** 2) ** 0.5
+
+    STATIC_THRESHOLD = 0.4   # px/frame — below this is camera shake noise
+    AXIS_RATIO       = 1.5   # horizontal must dominate by this factor to call it a pan
+
+    if speed < STATIC_THRESHOLD:
+        return "static", speed
+
+    if abs(avg_dx) > abs(avg_dy) * AXIS_RATIO:
+        return ("pan_right" if avg_dx < 0 else "pan_left"), speed
+    elif abs(avg_dy) > abs(avg_dx) * AXIS_RATIO:
+        return ("tilt_up" if avg_dy > 0 else "tilt_down"), speed
+    else:
+        # Diagonal — call it the dominant axis
+        return ("pan_right" if avg_dx < 0 else "pan_left"), speed
 
 
 # ─── GPT calls ──────────────────────────────────────────────────────────────
@@ -215,7 +334,6 @@ def _gpt_find_worst(video_path: str, timestamps: List[float],
     if not isinstance(result, list):
         return []
 
-    # Support both key names for backward cache compatibility
     def _score(r):
         return float(r.get("cinematic_score", r.get("quality_score", 1.0)))
 
@@ -235,8 +353,10 @@ def _gpt_find_worst(video_path: str, timestamps: List[float],
 def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
     """
     Returns (slots, video_meta).
-    video_meta is a dict with keys: video_type, visual_style, color_palette,
-                                    subject, lighting, description.
+    Each Slot includes:
+      - replace_end_frame: frame to resume original footage (may be beyond end_frame
+        if we're doing a "clean cut" to the next scene change)
+      - transition: SceneTransition with incoming motion type and next cut timestamp
     """
     info = _ffprobe(video_path)
     fps      = info["fps"]
@@ -259,7 +379,6 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
     if os.path.exists(cache_file):
         with open(cache_file) as f:
             cached = json.load(f)
-        # Support old list-only format
         if isinstance(cached, list):
             candidates, video_meta = cached, {}
         else:
@@ -305,10 +424,45 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
               f"({start_ts:.1f}→{end_ts:.1f}s)", flush=True)
         try:
             extract_anchor(video_path, mid_frame, anchor_path, fps)
-            extract_clip(video_path, start_frame, end_frame, clip_path, fps)
         except Exception as e:
             print(f"[detect] extraction failed: {e}", flush=True)
             continue
+
+        # ── Pass 3: scene handover analysis ──────────────────────────────
+        print(f"[detect] handover analysis for slot {sid[:8]}...", flush=True)
+
+        motion_type, motion_speed = _estimate_motion_type(video_path, start_ts, fps)
+        print(f"[detect]   incoming motion: {motion_type} ({motion_speed:.2f}px/f)",
+              flush=True)
+
+        next_cut_ts = _detect_next_cut(video_path, end_ts, NEXT_CUT_SEARCH_WINDOW)
+
+        # Extend replacement to next hard cut if it's within MAX_EXTENSION_S seconds
+        # and actually beyond the current slot window
+        if next_cut_ts > end_ts and (next_cut_ts - end_ts) <= MAX_EXTENSION_S:
+            replace_until_ts = min(next_cut_ts, duration)
+            replace_end_frame = min(int(replace_until_ts * fps), int(duration * fps) - 1)
+            print(f"[detect]   next cut at {next_cut_ts:.1f}s — "
+                  f"extending replacement to {replace_until_ts:.1f}s", flush=True)
+        else:
+            replace_until_ts = end_ts
+            replace_end_frame = end_frame
+            if next_cut_ts > 0:
+                print(f"[detect]   next cut at {next_cut_ts:.1f}s — "
+                      f"too far, keeping 5s window", flush=True)
+
+        try:
+            extract_clip(video_path, start_frame, replace_end_frame, clip_path, fps)
+        except Exception as e:
+            print(f"[detect] clean-cut clip extraction failed: {e}", flush=True)
+            continue
+
+        transition = SceneTransition(
+            motion_type=motion_type,
+            motion_speed=round(motion_speed, 2),
+            next_cut_ts=round(next_cut_ts, 3),
+            replace_until_ts=round(replace_until_ts, 3),
+        )
 
         slots.append(Slot(
             id=sid,
@@ -320,6 +474,8 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
             ),
             anchor_frame_path=anchor_path,
             issues=c.get("issues", []),
+            replace_end_frame=replace_end_frame,
+            transition=transition,
         ))
         print(f"[detect] slot {sid[:8]}: {c.get('reason', '')}", flush=True)
 

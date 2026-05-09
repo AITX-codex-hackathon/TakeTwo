@@ -4,6 +4,25 @@ import uuid
 
 
 @dataclass
+class SceneTransition:
+    """Camera motion context extracted from frames immediately before the bad slot."""
+    # static | pan_left | pan_right | tilt_up | tilt_down | dolly_in | dolly_out
+    motion_type: str = "static"
+    motion_speed: float = 0.0        # estimated magnitude in px/frame
+    next_cut_ts: float = -1.0        # timestamp of next hard cut in source (-1 = none found)
+    replace_until_ts: float = -1.0   # timestamp to resume original footage (-1 = use slot.end_frame)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SceneTransition":
+        return cls(
+            motion_type=d.get("motion_type", "static"),
+            motion_speed=float(d.get("motion_speed", 0.0)),
+            next_cut_ts=float(d.get("next_cut_ts", -1.0)),
+            replace_until_ts=float(d.get("replace_until_ts", -1.0)),
+        )
+
+
+@dataclass
 class Slot:
     id: str
     start_frame: int
@@ -12,13 +31,27 @@ class Slot:
     quality_score: float
     anchor_frame_path: str
     issues: List[str] = field(default_factory=list)
+    # Clean-cut: frame at which original footage resumes (-1 = use end_frame)
+    replace_end_frame: int = -1
+    # Motion context computed from frames before this slot
+    transition: Optional[SceneTransition] = None
 
     @property
     def duration_sec(self) -> float:
         return (self.end_frame - self.start_frame + 1) / self.fps
 
+    @property
+    def resume_frame(self) -> int:
+        """Frame at which original footage resumes after the replacement."""
+        return self.replace_end_frame if self.replace_end_frame != -1 else self.end_frame
+
+    @property
+    def replacement_duration_sec(self) -> float:
+        return (self.resume_frame - self.start_frame + 1) / self.fps
+
     @classmethod
     def from_dict(cls, d: dict) -> "Slot":
+        t = d.get("transition")
         return cls(
             id=d["id"],
             start_frame=d["start_frame"],
@@ -27,6 +60,8 @@ class Slot:
             quality_score=d["quality_score"],
             anchor_frame_path=d["anchor_frame_path"],
             issues=d.get("issues", []),
+            replace_end_frame=d.get("replace_end_frame", -1),
+            transition=SceneTransition.from_dict(t) if t else None,
         )
 
 

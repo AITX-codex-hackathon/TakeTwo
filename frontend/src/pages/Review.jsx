@@ -102,6 +102,7 @@ export default function Review({ jobId, onDone }) {
 
   const activeSlot = slots.find((s) => s.id === activeSlotId);
   const activeInserts = activeSlot ? (slotInserts[activeSlot.id] || []) : [];
+  const generatedInserts = activeInserts.filter((i) => i.clip_path);
   const selectedInsert = activeInserts.find((i) => i.id === selectedInsertId);
   const slotHasDecision = activeSlot
     ? activeInserts.some((i) => i.status === "approved" || i.status === "cut")
@@ -193,7 +194,8 @@ export default function Review({ jobId, onDone }) {
               const inserts = slotInserts[slot.id] || [];
               const decided = inserts.some((i) => i.status === "approved" || i.status === "cut");
               const startSec = (slot.start_frame / slot.fps).toFixed(1);
-              const endSec = (slot.end_frame / slot.fps).toFixed(1);
+              const resumeFrame = slot.replace_end_frame !== -1 ? slot.replace_end_frame : slot.end_frame;
+              const endSec = (resumeFrame / slot.fps).toFixed(1);
               return (
                 <article
                   key={slot.id}
@@ -249,7 +251,7 @@ export default function Review({ jobId, onDone }) {
           {activeSlot && !isProcessing && (
             <span>
               {(activeSlot.start_frame / activeSlot.fps).toFixed(1)}s –{" "}
-              {(activeSlot.end_frame / activeSlot.fps).toFixed(1)}s
+              {((activeSlot.replace_end_frame !== -1 ? activeSlot.replace_end_frame : activeSlot.end_frame) / activeSlot.fps).toFixed(1)}s
             </span>
           )}
         </div>
@@ -376,11 +378,11 @@ export default function Review({ jobId, onDone }) {
           )}
         </div>
 
-        {activeInserts.filter((i) => i.clip_path).length > 0 && (
+        {generatedInserts.length > 0 && (
           <>
             <div style={{ fontSize: 13, color: "#6B7280", fontWeight: 600 }}>Replacement options:</div>
             <div className="source-list" style={{ maxHeight: 280 }}>
-              {activeInserts.filter((i) => i.clip_path).map((ins) => (
+              {generatedInserts.map((ins) => (
                 <article
                   key={ins.id}
                   className={`source-card ${selectedInsertId === ins.id ? "active" : ""}`}

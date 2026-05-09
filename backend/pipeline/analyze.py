@@ -2,7 +2,8 @@
 Stage 2: Director's Cut analysis using GPT-4o.
 Sends 3 frames (before → problem → after) for temporal context.
 Treats video_meta as a hint, not a constraint — frame content is ground truth.
-Injects a motion directive so every replacement is kinetic, not static.
+Injects a motion directive so every replacement inherits the incoming camera
+velocity before easing into a cinematic handover.
 Cached per anchor frame.
 """
 import json
@@ -33,6 +34,16 @@ MOTION_BY_TYPE = {
 
 DEFAULT_MOTION = "slow push-in with subtle cinematic drift"
 
+MOTION_LABELS = {
+    "static": "a static or nearly locked-off shot",
+    "pan_left": "a leftward pan",
+    "pan_right": "a rightward pan",
+    "tilt_up": "an upward tilt",
+    "tilt_down": "a downward tilt",
+    "dolly_in": "a forward dolly-in",
+    "dolly_out": "a backward dolly-out",
+}
+
 
 PROMPT = """You are a film director giving notes on a low-production-value moment in a video.
 
@@ -50,27 +61,36 @@ your eyes — base every decision on the actual frame content.
 
 FLAGGED ISSUES: {issues}
 
+CINEMATIC HANDOVER STRATEGY:
+{handover_strategy}
+
+TARGET REPLACEMENT DURATION: {replacement_duration}
+INCOMING CAMERA MOTION: {incoming_motion}
+NEXT CLEAN CUT: {next_cut}
+
 MOTION DIRECTIVE (apply to every replacement prompt):
 "{motion_directive}"
 The original shot scored low on cinematic value — possibly dead air, flat light,
-or weak framing. Every replacement MUST include this camera movement. A static
-replacement is a failed replacement. Even "still" shots must have micro-motion:
-leaves moving, light shifting, subtle environmental life.
+weak framing, or amateur motion. Do not simply fix pixels. Redesign the shot as
+a cinematic sequence. The replacement MUST match the incoming camera velocity
+for the first few frames, then gradually ramp into motivated 3D movement. A
+static replacement is a failed replacement. Even "still" shots must have
+micro-motion: leaves moving, light shifting, subtle environmental life.
 
 Frames in order:
-  FRAME A — scene just BEFORE the problem (temporal context)
-  FRAME B — the PROBLEM FRAME (what needs replacing)
-  FRAME C — scene just AFTER the problem (temporal context)
+  FRAME A1–A6 — lead-in frames immediately before the replacement start
+  FRAME B — the anchor/problem frame where AI takes over
+  FRAME C — the next clean resume point, usually after the hard cut
 
 Return ONLY valid JSON:
 {{
   "description": "one sentence: what is literally happening in frame B",
   "issues_detail": "specific visual/technical problems in frame B",
-  "mood": "precise mood phrase from what you SEE + the required camera movement, e.g. 'golden hour street with slow push-in through traffic'",
+  "mood": "precise mood phrase from what you SEE + the handover motion, e.g. 'golden hour street, matching left pan into slow 3D push-in'",
   "replacement_prompts": [
-    "Prompt 1 — ground truth: actual subject/setting visible in B, {color_palette} tones, {lighting} lighting, MUST include {motion_directive}. Describe the motion explicitly. Under 40 words.",
-    "Prompt 2 — same subject and location as frames, different cinematic angle or moment, MUST include {motion_directive}, highest production value. Under 40 words.",
-    "Prompt 3 — most elevated Director's Cut interpretation of the actual scene. Same subject/location, push the lighting and motion to cinematic extreme. Under 40 words."
+    "Prompt 1 — ground truth: actual subject/setting visible in B, {color_palette} tones, {lighting} lighting, MUST include the initial velocity match and gradual cinematic ramp. Under 45 words.",
+    "Prompt 2 — same subject and location as frames, different cinematic angle or moment, MUST cover the full handover duration and end cleanly for a hard cut. Under 45 words.",
+    "Prompt 3 — most elevated Director's Cut interpretation of the actual scene. Same subject/location, push lighting and motion to cinematic extreme while respecting the initial velocity. Under 45 words."
   ],
   "negative_prompt": "static shot, frozen frame, no camera movement, cartoon, CGI, animation, text overlays, watermarks, wrong subject matter",
   "motion_directive": "{motion_directive}",
@@ -78,9 +98,64 @@ Return ONLY valid JSON:
 }}"""
 
 
+def _transition_context(slot: Optional[Slot], fallback_motion: str) -> dict:
+    if not slot or not slot.transition:
+        return {
+            "motion_directive": fallback_motion,
+            "handover_strategy": (
+                "No reliable transition metadata is available. Start compositionally "
+                "close to the anchor frame, then ease into cinematic motion."
+            ),
+            "replacement_duration": "5.0s",
+            "incoming_motion": "unknown",
+            "next_cut": "unknown",
+        }
+
+    transition = slot.transition
+    duration = max(0.1, slot.replacement_duration_sec)
+    motion_label = MOTION_LABELS.get(transition.motion_type, transition.motion_type)
+    clean_cut = slot.resume_frame != slot.end_frame
+
+    if transition.motion_type == "static":
+        lead = (
+            "Begin almost locked to the anchor composition for 0.3–0.5 seconds, "
+            "then ease smoothly into motion; do not snap from stillness into a fast move."
+        )
+    else:
+        lead = (
+            f"Match the existing {motion_label} at roughly "
+            f"{transition.motion_speed:.2f}px/frame for the first 0.5 seconds, "
+            "then accelerate gradually into the cinematic move."
+        )
+
+    if clean_cut:
+        strategy = (
+            f"Take over the scene for {duration:.1f}s until the next clean cut. "
+            "Do not try to stitch back into the amateur tail; build a complete "
+            "cinematic beat that can hard-cut invisibly into the next original scene."
+        )
+    else:
+        strategy = (
+            f"Replace the flagged {duration:.1f}s window. End on a stable, "
+            "hard-cutable composition so the splice does not feel like a visual jerk."
+        )
+
+    return {
+        "motion_directive": f"{lead} Then {fallback_motion}. End cleanly for a hard cut.",
+        "handover_strategy": strategy,
+        "replacement_duration": f"{duration:.1f}s",
+        "incoming_motion": f"{motion_label} ({transition.motion_speed:.2f}px/frame)",
+        "next_cut": (
+            f"{transition.next_cut_ts:.1f}s"
+            if transition.next_cut_ts and transition.next_cut_ts > 0
+            else "not detected within search window"
+        ),
+    }
+
+
 def _cache_path(anchor_path: str) -> str:
     name = os.path.splitext(os.path.basename(anchor_path))[0]
-    return str(config.CACHE / f"analyze_v2_{name}.json")
+    return str(config.CACHE / f"analyze_v3_{name}.json")
 
 
 def _extract_frame_at(video_path: str, timestamp: float) -> str:
@@ -121,34 +196,49 @@ def _call_gpt(anchor_path: str, issues: list, video_path: Optional[str],
     lighting = video_meta.get("lighting", "mixed")
     subject  = video_meta.get("subject", "mixed")
     desc     = video_meta.get("description", "video footage")
-    motion   = MOTION_BY_TYPE.get(vtype, DEFAULT_MOTION)
+    base_motion = MOTION_BY_TYPE.get(vtype, DEFAULT_MOTION)
+    transition = _transition_context(slot, base_motion)
+    motion = transition["motion_directive"]
 
     prompt_text = PROMPT.format(
         video_type=vtype, visual_style=vstyle, color_palette=palette,
         lighting=lighting, subject=subject, description=desc,
         motion_directive=motion,
+        handover_strategy=transition["handover_strategy"],
+        replacement_duration=transition["replacement_duration"],
+        incoming_motion=transition["incoming_motion"],
+        next_cut=transition["next_cut"],
         issues=", ".join(issues) if issues else "general quality issues",
     )
 
     content = [{"type": "text", "text": prompt_text}]
 
-    # ── Try to add temporal context (before/after frames) ──
+    # ── Try to add temporal context (lead-in/resume frames) ──
     if video_path and slot and os.path.exists(video_path):
         fps = slot.fps
-        mid_t   = ((slot.start_frame + slot.end_frame) / 2) / fps
-        before_t = max(0.0, mid_t - 3.0)
-        after_t  = mid_t + 3.0
+        start_t = slot.start_frame / fps
+        after_t = (slot.resume_frame + 1) / fps + 0.05
 
-        b64_before = _extract_frame_at(video_path, before_t)
-        b64_after  = _extract_frame_at(video_path, after_t)
+        lead_ts = []
+        for i in range(6):
+            ts = max(0.0, start_t - 0.9 + (i * 0.15))
+            if not lead_ts or abs(ts - lead_ts[-1]) > 0.03:
+                lead_ts.append(ts)
 
-        if b64_before:
-            content.append({"type": "text", "text": "FRAME A (context — before the problem):"})
-            content.append({"type": "image_url",
-                             "image_url": {"url": f"data:image/jpeg;base64,{b64_before}",
-                                           "detail": "low"}})
+        for i, ts in enumerate(lead_ts, start=1):
+            b64_lead = _extract_frame_at(video_path, ts)
+            if b64_lead:
+                content.append({
+                    "type": "text",
+                    "text": f"FRAME A{i} (lead-in {start_t - ts:.2f}s before AI takeover):",
+                })
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64_lead}", "detail": "low"},
+                })
+
+        b64_after = _extract_frame_at(video_path, after_t)
     else:
-        b64_before = None
         b64_after  = None
 
     # ── Problem frame (always present) ──
@@ -158,7 +248,7 @@ def _call_gpt(anchor_path: str, issues: list, video_path: Optional[str],
                                   "detail": "high"}})
 
     if video_path and slot and b64_after:
-        content.append({"type": "text", "text": "FRAME C (context — after the problem):"})
+        content.append({"type": "text", "text": "FRAME C (clean resume point after AI handover):"})
         content.append({"type": "image_url",
                          "image_url": {"url": f"data:image/jpeg;base64,{b64_after}",
                                        "detail": "low"}})
@@ -201,7 +291,7 @@ def analyze_anchor(anchor_path: str, issues: list,
         d = {}
 
     vtype  = video_meta.get("video_type", "general")
-    motion = MOTION_BY_TYPE.get(vtype, DEFAULT_MOTION)
+    motion = _transition_context(slot, MOTION_BY_TYPE.get(vtype, DEFAULT_MOTION))["motion_directive"]
 
     return SceneContext(
         description=d.get("description", "scene from video"),

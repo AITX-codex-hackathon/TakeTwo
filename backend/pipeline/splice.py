@@ -128,11 +128,12 @@ def apply_decisions(job: Job) -> str:
     for ins in ordered:
         slot = slots_by_id[ins.slot_id]
         next_path = os.path.join(config.OUTPUTS, f"{job.id}_step_{ins.id}.mp4")
+        resume_frame = slot.resume_frame
         if ins.status == "approved":
-            _replace_segment(current, ins.clip_path, slot.start_frame, slot.end_frame, slot.fps, next_path)
+            _replace_segment(current, ins.clip_path, slot.start_frame, resume_frame, slot.fps, next_path)
             ins.status = "applied"
         else:
-            _cut_segment(current, slot.start_frame, slot.end_frame, slot.fps, next_path)
+            _cut_segment(current, slot.start_frame, resume_frame, slot.fps, next_path)
             ins.status = "applied"
         current = next_path
 
