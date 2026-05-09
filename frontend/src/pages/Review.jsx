@@ -23,7 +23,7 @@ const STATUS_LABELS = {
   error: "Something went wrong",
 };
 
-export default function Review({ jobId, onDone }) {
+export default function Review({ jobId, onDone, onReset }) {
   const [job, setJob] = useState(null);
   const [applying, setApplying] = useState(false);
   const [notFound, setNotFound] = useState(false);
@@ -75,6 +75,7 @@ export default function Review({ jobId, onDone }) {
             <AlertTriangle size={40} style={{ color: "#f87171" }} />
             <h2>Session expired</h2>
             <p>This job no longer exists — the server may have restarted. Please re-upload your video.</p>
+            <button className="btn btn-primary" onClick={onReset} style={{ marginTop: 16 }}>Re-upload Video</button>
           </div>
         </div>
       </section>
@@ -167,7 +168,12 @@ export default function Review({ jobId, onDone }) {
         </div>
 
         {isError && (
-          <div className="error-message">{job.error}</div>
+          <div className="error-message" style={{ display: "flex", flexDirection: "column", gap: "10px", alignItems: "center" }}>
+            {job.error}
+            <button className="btn btn-primary" onClick={onReset} style={{ padding: "8px 16px", fontSize: 14 }}>
+              Re-upload Video
+            </button>
+          </div>
         )}
 
         {isProcessing && (
@@ -184,6 +190,9 @@ export default function Review({ jobId, onDone }) {
           <div className="empty-source" style={{ minHeight: 200 }}>
             <CheckCircle size={32} style={{ color: "#4ade80" }} />
             <p>No bad clips found!</p>
+            <button className="btn btn-primary" onClick={onReset} style={{ marginTop: 12, padding: "8px 16px", fontSize: 14 }}>
+              Re-upload Video
+            </button>
           </div>
         )}
 
@@ -205,7 +214,7 @@ export default function Review({ jobId, onDone }) {
                     width: 74,
                     aspectRatio: "16/9",
                     borderRadius: 10,
-                    background: "#1F2937",
+                    background: "rgba(255, 255, 255, 0.6)",
                     display: "grid",
                     placeItems: "center",
                     color: "#6B7280",
@@ -390,7 +399,7 @@ export default function Review({ jobId, onDone }) {
                     src={fileUrl(jobId, "clip", ins.clip_path.split("/").pop())}
                     muted
                     playsInline
-                    style={{ width: 74, aspectRatio: "16/9", borderRadius: 10, objectFit: "cover", background: "#1F2937", flexShrink: 0 }}
+                    style={{ width: 74, aspectRatio: "16/9", borderRadius: 10, objectFit: "cover", background: "rgba(255, 255, 255, 0.6)", flexShrink: 0 }}
                     onMouseOver={(e) => e.target.play()}
                     onMouseOut={(e) => { e.target.pause(); e.target.currentTime = 0; }}
                   />

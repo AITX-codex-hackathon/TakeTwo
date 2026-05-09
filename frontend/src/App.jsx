@@ -26,6 +26,10 @@ export default function App() {
     setPage("upload");
   }
 
+  function handleHomeClick() {
+    if (page !== "login") handleReset();
+  }
+
   function handleLogin() {
     setPage("upload");
   }
@@ -39,7 +43,7 @@ export default function App() {
         </div>
       ) : (
         <header className="editor-topnav">
-          <div className="looply-brand">
+          <div className="looply-brand" onClick={handleHomeClick} style={{ cursor: "pointer" }}>
             <span className="brand-mark"><Film size={19} /></span>
             <strong>TakeTwo</strong>
           </div>
@@ -48,7 +52,7 @@ export default function App() {
       <div className={page === "login" ? "main-content" : "editor-content"}>
         {page === "login" && <Login onLogin={handleLogin} />}
         {page === "upload" && <Upload onUploaded={handleUploaded} />}
-        {page === "review" && <Review jobId={jobId} onDone={handleDone} />}
+        {page === "review" && <Review jobId={jobId} onDone={handleDone} onReset={handleReset} />}
         {page === "done" && (
           <Done jobId={jobId} outputPath={outputPath} onReset={handleReset} />
         )}

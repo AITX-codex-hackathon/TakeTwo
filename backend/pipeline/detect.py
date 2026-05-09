@@ -171,7 +171,7 @@ def find_bad_clips(video_path: str) -> List[Slot]:
         anchor_path = os.path.join(config.FRAMES, f"{sid}.png")
         clip_path = os.path.join(config.CLIPS, f"{sid}_original.mp4")
 
-        print(f"[detect] extracting slot at {ts:.1f}s ({start_ts:.1f}s → {end_ts:.1f}s)", flush=True)
+        print(f"[detect] extracting slot at {ts:.1f}s ({start_ts:.1f}s -> {end_ts:.1f}s)", flush=True)
         try:
             extract_anchor(video_path, mid_frame, anchor_path, fps)
             extract_clip(video_path, start_frame, end_frame, clip_path, fps)

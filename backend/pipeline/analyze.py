@@ -57,7 +57,7 @@ def analyze_anchor(anchor_path: str, issues: list) -> SceneContext:
         )
         text = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
         d = json.loads(text)
-        print(f"[analyze] GPT-4o: {d.get('description')} → {d.get('recommendation')}", flush=True)
+        print(f"[analyze] GPT-4o: {d.get('description')} -> {d.get('recommendation')}", flush=True)
         with open(cache_file, "w") as f:
             json.dump(d, f)
     except Exception as e:

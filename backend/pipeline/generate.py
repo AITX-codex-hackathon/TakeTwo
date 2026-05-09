@@ -47,7 +47,7 @@ def _gen_fal(anchor_path: str, prompt: str, out_path: str) -> str:
     print(f"[generate/fal] uploading anchor frame...", flush=True)
     img_bytes = _upscale_anchor(anchor_path)
     image_url = fal_client.upload(img_bytes, "image/png")
-    print(f"[generate/fal] uploaded → {image_url}", flush=True)
+    print(f"[generate/fal] uploaded -> {image_url}", flush=True)
 
     print(f"[generate/fal] submitting Kling v2 (5s)...", flush=True)
     result = fal_client.subscribe(
@@ -67,7 +67,7 @@ def _gen_fal(anchor_path: str, prompt: str, out_path: str) -> str:
     v = requests.get(video_url, timeout=120)
     with open(out_path, "wb") as f:
         f.write(v.content)
-    print(f"[generate/fal] saved → {os.path.basename(out_path)}", flush=True)
+    print(f"[generate/fal] saved -> {os.path.basename(out_path)}", flush=True)
     return out_path
 
 
@@ -96,7 +96,7 @@ def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
         else:
             try:
                 provider_fn(slot.anchor_frame_path, full_prompt, out_path)
-                print(f"[generate] clip {i+1} done → {os.path.basename(out_path)}", flush=True)
+                print(f"[generate] clip {i+1} done -> {os.path.basename(out_path)}", flush=True)
             except Exception as e:
                 print(f"[generate] ERROR clip {i+1}: {e}", flush=True)
                 continue

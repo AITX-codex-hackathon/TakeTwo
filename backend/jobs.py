@@ -54,7 +54,7 @@ def load_all() -> None:
             with open(os.path.join(_jobs_dir, fname)) as f:
                 d = json.load(f)
             job = Job.from_dict(d)
-            # Jobs that were mid-pipeline when server died → mark as error
+            # Jobs that were mid-pipeline when server died -> mark as error
             if job.status in ("detecting", "analyzing", "generating", "applying"):
                 job.status = "error"
                 job.error = "Server restarted while pipeline was running. Re-upload to retry."

@@ -61,7 +61,7 @@ def _process(job_id: str):
             issues_str = ", ".join(slot.issues) if slot.issues else "quality issues"
             _log(job, "angel", f"Examining clip {i+1}/{n} ({issues_str})... reading the scene composition and emotional tone.")
             ctx = analyze.analyze_anchor(slot.anchor_frame_path, slot.issues)
-            print(f"[job {job_id[:8]}] → recommendation={ctx.recommendation} mood={ctx.mood}", flush=True)
+            print(f"[job {job_id[:8]}] -> recommendation={ctx.recommendation} mood={ctx.mood}", flush=True)
             _log(job, "angel", f"Analysis done. Mood: {ctx.mood}. My recommendation: {'replace with something better ✨' if ctx.recommendation == 'replace' else 'cut this clip entirely ✂️'}.")
             slot_contexts[slot.id] = ctx
 
