@@ -1,7 +1,7 @@
 """
 Stage 2: Analyze the anchor frame of a bad clip using a VLM.
 Describes what's wrong, the scene context, and suggests replacement prompts.
-Supports Anthropic (Claude) and OpenAI-compatible backends.
+Supports Google (Gemini), Anthropic (Claude), and OpenAI-compatible backends.
 """
 import base64
 import json
@@ -75,9 +75,26 @@ def _analyze_openai(anchor_path: str, issues: list) -> dict:
     return json.loads(text)
 
 
+def _analyze_vertexai(anchor_path: str, issues: list) -> dict:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, Part, Image
+    vertexai.init(project=config.VERTEXAI_PROJECT, location=config.VERTEXAI_LOCATION)
+    model = GenerativeModel(config.VLM_MODEL)
+    with open(anchor_path, "rb") as f:
+        img_bytes = f.read()
+    resp = model.generate_content([
+        PROMPT.format(issues=", ".join(issues)),
+        Part.from_data(data=img_bytes, mime_type="image/png"),
+    ])
+    text = resp.text.replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
+
+
 def analyze_anchor(anchor_path: str, issues: list) -> SceneContext:
     try:
-        if config.VLM_PROVIDER == "anthropic":
+        if config.VLM_PROVIDER == "vertexai":
+            d = _analyze_vertexai(anchor_path, issues)
+        elif config.VLM_PROVIDER == "anthropic":
             d = _analyze_anthropic(anchor_path, issues)
         else:
             d = _analyze_openai(anchor_path, issues)

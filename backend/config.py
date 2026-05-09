@@ -17,8 +17,11 @@ for d in (UPLOADS, CLIPS, OUTPUTS, FRAMES):
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-VLM_PROVIDER = os.getenv("VLM_PROVIDER", "anthropic")
-VLM_MODEL = os.getenv("VLM_MODEL", "claude-sonnet-4-6")
+VLM_PROVIDER = os.getenv("VLM_PROVIDER", "vertexai")
+VLM_MODEL = os.getenv("VLM_MODEL", "gemini-2.0-flash-001")
+
+VERTEXAI_PROJECT = os.getenv("VERTEXAI_PROJECT", "")
+VERTEXAI_LOCATION = os.getenv("VERTEXAI_LOCATION", "us-central1")
 
 I2V_PROVIDER = os.getenv("I2V_PROVIDER", "stub")
 LUMA_API_KEY = os.getenv("LUMA_API_KEY", "")

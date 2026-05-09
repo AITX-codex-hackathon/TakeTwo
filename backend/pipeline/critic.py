@@ -53,7 +53,9 @@ def review(insert: Insert, anchor_path: str, issues: list) -> Insert:
     issues_str = ", ".join(issues) if issues else "general quality"
 
     try:
-        if config.VLM_PROVIDER == "anthropic":
+        if config.VLM_PROVIDER == "vertexai":
+            d = _review_vertexai(anchor_path, first_path, issues_str)
+        elif config.VLM_PROVIDER == "anthropic":
             d = _review_anthropic(anchor_path, first_path, issues_str)
         else:
             d = _review_openai(anchor_path, first_path, issues_str)
@@ -63,6 +65,26 @@ def review(insert: Insert, anchor_path: str, issues: list) -> Insert:
     insert.critic_pass = bool(d.get("pass", False))
     insert.critic_notes = d.get("notes", "")
     return insert
+
+
+def _review_vertexai(anchor_path: str, gen_path: str, issues_str: str) -> dict:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel, Part
+    vertexai.init(project=config.VERTEXAI_PROJECT, location=config.VERTEXAI_LOCATION)
+    model = GenerativeModel(config.VLM_MODEL)
+    with open(anchor_path, "rb") as f:
+        anchor_bytes = f.read()
+    with open(gen_path, "rb") as f:
+        gen_bytes = f.read()
+    resp = model.generate_content([
+        PROMPT.format(issues=issues_str),
+        "Image A (original bad frame):",
+        Part.from_data(data=anchor_bytes, mime_type="image/png"),
+        "Image B (generated replacement):",
+        Part.from_data(data=gen_bytes, mime_type="image/png"),
+    ])
+    text = resp.text.replace("```json", "").replace("```", "").strip()
+    return json.loads(text)
 
 
 def _review_anthropic(anchor_path: str, gen_path: str, issues_str: str) -> dict:
