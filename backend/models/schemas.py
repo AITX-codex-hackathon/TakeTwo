@@ -35,6 +35,7 @@ class Slot:
     replace_end_frame: int = -1
     # Motion context computed from frames before this slot
     transition: Optional[SceneTransition] = None
+    resume_frame_path: str = ""
 
     @property
     def duration_sec(self) -> float:
@@ -62,6 +63,7 @@ class Slot:
             issues=d.get("issues", []),
             replace_end_frame=d.get("replace_end_frame", -1),
             transition=SceneTransition.from_dict(t) if t else None,
+            resume_frame_path=d.get("resume_frame_path", ""),
         )
 
 

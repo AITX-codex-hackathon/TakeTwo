@@ -1,6 +1,6 @@
 """
 Stage 2: Director's Cut analysis using GPT-4o.
-Sends 3 frames (before → problem → after) for temporal context.
+Sends lead-in frames, the problem anchor, and the resume frame for context.
 Treats video_meta as a hint, not a constraint — frame content is ground truth.
 Injects a motion directive so every replacement inherits the incoming camera
 velocity before easing into a cinematic handover.
@@ -55,7 +55,7 @@ STYLE HINT (auto-detected — guide only, not a constraint):
 - Subject: {subject}
 - Summary: {description}
 
-IMPORTANT: The three frames are ground truth. If the frames contradict the hint
+IMPORTANT: The supplied frames are ground truth. If the frames contradict the hint
 (e.g., hint says "anamorphic cinema" but frames look like a phone vlog), trust
 your eyes — base every decision on the actual frame content.
 
@@ -70,12 +70,15 @@ NEXT CLEAN CUT: {next_cut}
 
 MOTION DIRECTIVE (apply to every replacement prompt):
 "{motion_directive}"
-The original shot scored low on cinematic value — possibly dead air, flat light,
-weak framing, or amateur motion. Do not simply fix pixels. Redesign the shot as
-a cinematic sequence. The replacement MUST match the incoming camera velocity
-for the first few frames, then gradually ramp into motivated 3D movement. A
-static replacement is a failed replacement. Even "still" shots must have
-micro-motion: leaves moving, light shifting, subtle environmental life.
+The original shot scored low on cinematic value — possibly dead air, darkness,
+flat light, weak framing, or amateur motion. Do not simply fix pixels. Redesign
+the shot as a subtle cinematic sequence that still belongs to this exact video.
+The replacement MUST match the incoming camera velocity for the first few
+frames, then gradually ramp into motivated 3D movement. Avoid excessive action.
+If the source is underexposed, lift shadows naturally, preserve believable
+highlights, and keep the scene mood. A static replacement is a failed
+replacement. Even "still" shots must have small real-world motion: breathing,
+cloth, leaves, dust, light, reflections, or handheld drift.
 
 Frames in order:
   FRAME A1–A6 — lead-in frames immediately before the replacement start
@@ -88,11 +91,11 @@ Return ONLY valid JSON:
   "issues_detail": "specific visual/technical problems in frame B",
   "mood": "precise mood phrase from what you SEE + the handover motion, e.g. 'golden hour street, matching left pan into slow 3D push-in'",
   "replacement_prompts": [
-    "Prompt 1 — ground truth: actual subject/setting visible in B, {color_palette} tones, {lighting} lighting, MUST include the initial velocity match and gradual cinematic ramp. Under 45 words.",
-    "Prompt 2 — same subject and location as frames, different cinematic angle or moment, MUST cover the full handover duration and end cleanly for a hard cut. Under 45 words.",
-    "Prompt 3 — most elevated Director's Cut interpretation of the actual scene. Same subject/location, push lighting and motion to cinematic extreme while respecting the initial velocity. Under 45 words."
+    "Prompt 1 — ground truth: actual subject/setting visible in B, {color_palette} tones, {lighting} lighting, subtle photoreal cinematic improvement, MUST include the initial velocity match and gradual cinematic ramp. Under 50 words.",
+    "Prompt 2 — same subject and location as frames, improved exposure if dark, different but compatible cinematic angle or moment, MUST cover the full handover duration and end cleanly. Under 50 words.",
+    "Prompt 3 — most elevated but restrained Director's Cut interpretation of the actual scene. Same subject/location/theme, natural light improvement, realistic motion, no cartoon look. Under 50 words."
   ],
-  "negative_prompt": "static shot, frozen frame, no camera movement, cartoon, CGI, animation, text overlays, watermarks, wrong subject matter",
+  "negative_prompt": "static shot, frozen frame, no camera movement, cartoon, CGI, animation, anime, plastic skin, over-sharpened, oversaturated, surreal, text overlays, watermarks, wrong subject matter",
   "motion_directive": "{motion_directive}",
   "recommendation": "replace or cut — cut only if the scene content adds zero narrative value to a {video_type} video"
 }}"""
@@ -132,12 +135,14 @@ def _transition_context(slot: Optional[Slot], fallback_motion: str) -> dict:
         strategy = (
             f"Take over the scene for {duration:.1f}s until the next clean cut. "
             "Do not try to stitch back into the amateur tail; build a complete "
-            "cinematic beat that can hard-cut invisibly into the next original scene."
+            "cinematic beat that can hard-cut invisibly into the next original scene. "
+            "Keep the shot restrained and thematically consistent."
         )
     else:
         strategy = (
             f"Replace the flagged {duration:.1f}s window. End on a stable, "
-            "hard-cutable composition so the splice does not feel like a visual jerk."
+            "hard-cutable composition that matches the supplied resume frame so the "
+            "splice does not feel like a visual jerk."
         )
 
     return {
@@ -304,6 +309,6 @@ def analyze_anchor(anchor_path: str, issues: list,
         ],
         recommendation=d.get("recommendation", "replace"),
         negative_prompt=d.get("negative_prompt",
-                               "static shot, no camera movement, cartoon, CGI, watermarks"),
+                               "static shot, no camera movement, cartoon, CGI, animation, anime, plastic skin, oversaturated, watermarks"),
         motion_directive=d.get("motion_directive", motion),
     )

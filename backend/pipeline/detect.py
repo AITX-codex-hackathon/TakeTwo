@@ -418,6 +418,7 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
 
         sid         = new_id()
         anchor_path = os.path.join(config.FRAMES, f"{sid}.png")
+        resume_path = os.path.join(config.FRAMES, f"{sid}_resume.png")
         clip_path   = os.path.join(config.CLIPS,  f"{sid}_original.mp4")
 
         print(f"[detect] extracting slot {sid[:8]} at {ts:.1f}s "
@@ -453,6 +454,8 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
 
         try:
             extract_clip(video_path, start_frame, replace_end_frame, clip_path, fps)
+            resume_anchor_frame = min(replace_end_frame + 1, int(duration * fps) - 1)
+            extract_anchor(video_path, resume_anchor_frame, resume_path, fps)
         except Exception as e:
             print(f"[detect] clean-cut clip extraction failed: {e}", flush=True)
             continue
@@ -476,6 +479,7 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
             issues=c.get("issues", []),
             replace_end_frame=replace_end_frame,
             transition=transition,
+            resume_frame_path=resume_path,
         ))
         print(f"[detect] slot {sid[:8]}: {c.get('reason', '')}", flush=True)
 

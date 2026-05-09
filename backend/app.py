@@ -66,6 +66,16 @@ def _process_slot(job: Job, slot, ctx, idx: int, total: int) -> list:
          f"{vtype} style, {palette} tones, ARRI-quality footage. "
          "This takes ~2–3 min per clip ⏳")
 
+    if slot.replace_end_frame != -1 and slot.replace_end_frame != slot.end_frame:
+        _log(job, "angel",
+             f"I'm taking over the scene until the next clean cut "
+             f"({slot.replacement_duration_sec:.1f}s total) so the splice lands on a hard edit, "
+             "not a shaky-to-smooth glitch.")
+    elif getattr(slot, "resume_frame_path", ""):
+        _log(job, "angel",
+             "No nearby hard cut, so I'm using the resume frame as an outro target "
+             "to match back into the original shot cleanly.")
+
     raw_inserts = generate.generate_for_slot(slot, ctx)
 
     for ins in raw_inserts:

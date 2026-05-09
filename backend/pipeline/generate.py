@@ -18,7 +18,6 @@ cfg_scale = 0.7:
   At 0.7 they become mandates.
 """
 import os
-import math
 import time
 import requests
 from typing import List
@@ -31,7 +30,7 @@ from .api_utils import retry_api
 # ─── upscale helper ─────────────────────────────────────────────────────────
 
 def _upscale_anchor(path: str) -> bytes:
-    """Scale anchor frame to 1024px wide — Kling v2.1 benefits from higher res input."""
+    """Scale frame to 1024px wide — Kling benefits from higher-res input."""
     import subprocess
     import shutil
     import tempfile
@@ -50,10 +49,18 @@ def _upscale_anchor(path: str) -> bytes:
     return data
 
 
+def _configure_fal():
+    if not config.FAL_API_KEY:
+        raise RuntimeError(
+            "FAL_API_KEY is missing. Refusing to fall back to static stub generation."
+        )
+    os.environ["FAL_KEY"] = config.FAL_API_KEY
+
+
 # ─── providers ──────────────────────────────────────────────────────────────
 
 def _gen_stub(anchor_path: str, prompt: str, neg_prompt: str, out_path: str,
-              duration_s: int) -> str:
+              duration_s: int, end_frame_path: str = "") -> str:
     """Offline fallback: static loop for UI testing. No GPU, no motion."""
     import subprocess, shutil
     ffmpeg = shutil.which("ffmpeg")
@@ -70,31 +77,43 @@ def _gen_stub(anchor_path: str, prompt: str, neg_prompt: str, out_path: str,
 
 @retry_api(max_retries=2, base_delay=10)
 def _gen_fal_kling_v3(anchor_path: str, prompt: str, neg_prompt: str,
-                      out_path: str, duration_s: int) -> str:
+                      out_path: str, duration_s: int,
+                      end_frame_path: str = "") -> str:
     """
     Kling v3 Pro via fal.ai.
     Uses start_image_url and duration 3-15s so the generation can take over
     the scene until a clean cut instead of always producing a fixed 5s patch.
     """
     import fal_client
-    os.environ.setdefault("FAL_KEY", config.FAL_API_KEY)
+    _configure_fal()
 
     print("[generate/kling-v3] upscaling anchor to 1024px...", flush=True)
     img_bytes = _upscale_anchor(anchor_path)
     start_image_url = fal_client.upload(img_bytes, "image/png")
     print(f"[generate/kling-v3] uploaded anchor → {start_image_url}", flush=True)
 
+    end_image_url = None
+    if end_frame_path and os.path.exists(end_frame_path):
+        print("[generate/kling-v3] upscaling resume frame for outro lock...", flush=True)
+        end_bytes = _upscale_anchor(end_frame_path)
+        end_image_url = fal_client.upload(end_bytes, "image/png")
+        print(f"[generate/kling-v3] uploaded resume frame → {end_image_url}", flush=True)
+
+    arguments = {
+        "prompt":          prompt,
+        "negative_prompt": neg_prompt,
+        "start_image_url": start_image_url,
+        "duration":        str(duration_s),
+        "generate_audio":  False,
+        "cfg_scale":       0.72,
+    }
+    if end_image_url:
+        arguments["end_image_url"] = end_image_url
+
     print(f"[generate/kling-v3] submitting to Kling v3 Pro ({duration_s}s)...", flush=True)
     handler = fal_client.submit(
         "fal-ai/kling-video/v3/pro/image-to-video",
-        arguments={
-            "prompt":          prompt,
-            "negative_prompt": neg_prompt,
-            "start_image_url": start_image_url,
-            "duration":        str(duration_s),
-            "generate_audio":  False,
-            "cfg_scale":       0.7,
-        },
+        arguments=arguments,
     )
 
     from fal_client.client import Completed
@@ -128,7 +147,8 @@ def _gen_fal_kling_v3(anchor_path: str, prompt: str, neg_prompt: str,
 
 @retry_api(max_retries=2, base_delay=10)
 def _gen_fal_kling_v21(anchor_path: str, prompt: str, neg_prompt: str,
-                       out_path: str, duration_s: int) -> str:
+                       out_path: str, duration_s: int,
+                       end_frame_path: str = "") -> str:
     """
     Kling v2.1 standard via fal.ai.
     v2.1 has significantly better 3D scene understanding than v2/master —
@@ -137,7 +157,7 @@ def _gen_fal_kling_v21(anchor_path: str, prompt: str, neg_prompt: str,
     pixel-level warping.
     """
     import fal_client
-    os.environ.setdefault("FAL_KEY", config.FAL_API_KEY)
+    _configure_fal()
 
     print("[generate/kling] upscaling anchor to 1024px...", flush=True)
     img_bytes = _upscale_anchor(anchor_path)
@@ -192,14 +212,14 @@ def _gen_fal_kling_v21(anchor_path: str, prompt: str, neg_prompt: str,
 
 @retry_api(max_retries=2, base_delay=10)
 def _gen_fal_luma(anchor_path: str, prompt: str, neg_prompt: str, out_path: str,
-                  duration_s: int) -> str:
+                  duration_s: int, end_frame_path: str = "") -> str:
     """
     Luma Dream Machine via fal.ai.
     Produces softer, more dream-like motion — good for nature/travel.
     Kling is sharper and more geometrically accurate.
     """
     import fal_client
-    os.environ.setdefault("FAL_KEY", config.FAL_API_KEY)
+    _configure_fal()
 
     print("[generate/luma] upscaling anchor...", flush=True)
     img_bytes = _upscale_anchor(anchor_path)
@@ -257,24 +277,44 @@ PROVIDERS = {
 def _generation_duration(slot: Slot) -> int:
     duration = getattr(slot, "replacement_duration_sec", slot.duration_sec)
     # Kling v3 Pro supports integer durations from 3s to 15s.
-    return max(3, min(15, math.ceil(duration)))
+    return max(3, min(15, round(duration)))
 
 
 # ─── entry point ────────────────────────────────────────────────────────────
 
 def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
-    provider_fn = PROVIDERS.get(config.I2V_PROVIDER, _gen_stub)
+    if config.I2V_PROVIDER not in PROVIDERS:
+        raise RuntimeError(
+            f"Unknown I2V_PROVIDER={config.I2V_PROVIDER!r}. "
+            f"Expected one of: {', '.join(sorted(PROVIDERS))}."
+        )
+    provider_fn = PROVIDERS[config.I2V_PROVIDER]
+    if config.I2V_PROVIDER != "stub" and not config.FAL_API_KEY:
+        raise RuntimeError(
+            f"I2V_PROVIDER={config.I2V_PROVIDER} requires FAL_API_KEY. "
+            "Refusing to produce a static slideshow."
+        )
     print(f"[generate] provider={config.I2V_PROVIDER} slot={slot.id[:8]}", flush=True)
 
     motion = ctx.motion_directive or "slow push-in with subtle cinematic drift"
     mood   = ctx.mood             or "cinematic"
-    neg    = ctx.negative_prompt  or "static shot, frozen frame, no camera movement, CGI, cartoon, watermark"
+    neg    = (
+        ctx.negative_prompt
+        or "static shot, frozen frame, no camera movement, CGI, cartoon, watermark"
+    )
+    neg = (
+        f"{neg}, slideshow, still image, Ken Burns effect, fake parallax, "
+        "cartoon, anime, CGI, plastic skin, waxy faces, oversaturated colors, "
+        "surreal objects, wrong subject, wrong location, text, subtitles, logo, watermark"
+    )
     duration_s = _generation_duration(slot)
     replaced_s = getattr(slot, "replacement_duration_sec", slot.duration_sec)
     transition = slot.transition
     incoming_motion = "unknown"
     if transition:
         incoming_motion = f"{transition.motion_type} at {transition.motion_speed:.2f}px/frame"
+    clean_cut = bool(transition and slot.resume_frame != slot.end_frame)
+    end_frame_path = "" if clean_cut else getattr(slot, "resume_frame_path", "")
 
     inserts = []
     for i, prompt_text in enumerate(ctx.replacement_prompts[:2]):
@@ -288,11 +328,14 @@ def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
             f"Camera: {motion}. "
             f"Mood: {mood}. "
             f"Incoming source motion: {incoming_motion}. "
-            "Keep scene alive: subtle wind, shifting light rays, ambient environmental motion, "
-            "natural subject micro-movements. "
-            "Photorealistic 4K, ARRI Alexa color science, shallow depth of field, "
-            "professional color grade, smooth cinematic motion, no compression artifacts. "
-            "End on a composition that can hard-cut cleanly into the next original scene."
+            "Keep the exact subject, location, era, wardrobe, architecture, lens feel, and color theme. "
+            "Improve only what is broken: stabilize amateur motion, add subtle dimensional camera movement, "
+            "and if the shot is very dark, naturally lift shadow detail while preserving believable highlights. "
+            "Keep scene alive with restrained real-world micro-motion: breathing, cloth, dust, reflections, "
+            "wind, or shifting practical light. Photorealistic live-action footage, natural skin texture, "
+            "real lens optics, physically plausible lighting, smooth cinematic motion, no compression artifacts. "
+            "Do not make it cartoonish, surreal, glossy, over-stylized, or unrelated. "
+            "End on a composition that fits the next original frame or hard-cuts cleanly into it."
         )
         print(f"[generate] prompt {i+1}: {full_prompt[:140]}...", flush=True)
         print(f"[generate] neg:    {neg[:80]}...", flush=True)
@@ -301,7 +344,8 @@ def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
             print(f"[generate] clip {i+1} already exists — skipping generation", flush=True)
         else:
             try:
-                provider_fn(slot.anchor_frame_path, full_prompt, neg, out_path, duration_s)
+                provider_fn(slot.anchor_frame_path, full_prompt, neg, out_path,
+                            duration_s, end_frame_path)
                 print(f"[generate] clip {i+1} saved → {os.path.basename(out_path)}", flush=True)
             except Exception as e:
                 print(f"[generate] ERROR clip {i+1}: {e}", flush=True)
@@ -314,5 +358,10 @@ def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
             prompt=full_prompt,
             label=prompt_text[:80],
         ))
+
+    if not inserts:
+        raise RuntimeError(
+            f"{config.I2V_PROVIDER} did not produce any replacement clips for slot {slot.id}."
+        )
 
     return inserts
