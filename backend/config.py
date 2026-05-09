@@ -19,7 +19,7 @@ for d in (UPLOADS, CLIPS, OUTPUTS, FRAMES, CACHE):
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 VLM_MODEL = os.getenv("VLM_MODEL", "gpt-4o")
 
-I2V_PROVIDER = os.getenv("I2V_PROVIDER", "fal_kling_v3")
+I2V_PROVIDER = os.getenv("I2V_PROVIDER", "fal_kling_v21")
 LUMA_API_KEY = os.getenv("LUMA_API_KEY", "")
 FAL_API_KEY = os.getenv("FAL_API_KEY", "")
 

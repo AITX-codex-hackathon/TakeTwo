@@ -76,7 +76,7 @@ def _process_slot(job: Job, slot, ctx, idx: int, total: int) -> list:
              "No nearby hard cut, so I'm using the resume frame as an outro target "
              "to match back into the original shot cleanly.")
 
-    raw_inserts = generate.generate_for_slot(slot, ctx)
+    raw_inserts = generate.generate_for_slot(slot, ctx, video_meta=job.video_meta)
 
     for ins in raw_inserts:
         try:

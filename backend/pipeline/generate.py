@@ -2,8 +2,9 @@
 Stage 3: Generate a cinematic handover clip.
 
 Providers (set I2V_PROVIDER in .env):
-  fal_kling  — Kling v3 Pro via fal.ai  (best cinematic handover)
+  fal_kling  — Kling v2.1 standard via fal.ai  (best default for real motion)
   fal_kling_v21 — Kling v2.1 standard via fal.ai
+  fal_kling_v3 — Kling v3 Pro via fal.ai
   fal_luma   — Luma Dream Machine via fal.ai    (softer, dreamlike motion)
   stub       — static ffmpeg loop, zero GPU cost, for offline testing
 
@@ -266,8 +267,8 @@ def _gen_fal_luma(anchor_path: str, prompt: str, neg_prompt: str, out_path: str,
 
 PROVIDERS = {
     "stub":      _gen_stub,
-    "fal":       _gen_fal_kling_v3,   # legacy alias
-    "fal_kling": _gen_fal_kling_v3,
+    "fal":       _gen_fal_kling_v21,  # legacy alias
+    "fal_kling": _gen_fal_kling_v21,
     "fal_kling_v3": _gen_fal_kling_v3,
     "fal_kling_v21": _gen_fal_kling_v21,
     "fal_luma":  _gen_fal_luma,
@@ -276,13 +277,51 @@ PROVIDERS = {
 
 def _generation_duration(slot: Slot) -> int:
     duration = getattr(slot, "replacement_duration_sec", slot.duration_sec)
+    if config.I2V_PROVIDER in ("fal", "fal_kling", "fal_kling_v21"):
+        return 10 if duration > 7 else 5
     # Kling v3 Pro supports integer durations from 3s to 15s.
     return max(3, min(15, round(duration)))
 
 
+def _style_motion(video_meta: dict, fallback_motion: str) -> str:
+    video_type = (video_meta or {}).get("video_type", "cinematic").lower()
+    subject = (video_meta or {}).get("primary_subject", "")
+    base = fallback_motion or "slow push-in with subtle cinematic drift"
+
+    if "vlog" in video_type or "talking" in video_type:
+        style = (
+            "handheld stabilized vlog motion, tiny shoulder sway, gentle push-in, "
+            "natural face and body micro-movement"
+        )
+    elif "travel" in video_type or "landscape" in video_type:
+        style = (
+            "slow dolly forward with visible foreground-background parallax, "
+            "soft pan following the environment, wind and atmospheric movement"
+        )
+    elif "product" in video_type or "object" in video_type:
+        style = (
+            "controlled slider move with a subtle orbit, crisp depth separation, "
+            "realistic reflections and highlight rolloff"
+        )
+    elif "sports" in video_type or "action" in video_type:
+        style = (
+            "energetic stabilized tracking move, strong directional motion, "
+            "realistic momentum and motion blur"
+        )
+    else:
+        style = (
+            "cinematic dolly or pan with real 3D parallax, layered foreground and "
+            "background movement, physically plausible camera motion"
+        )
+
+    if subject:
+        style += f", keep attention anchored on {subject}"
+    return f"{base}. Movement style: {style}."
+
+
 # ─── entry point ────────────────────────────────────────────────────────────
 
-def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
+def generate_for_slot(slot: Slot, ctx: SceneContext, video_meta: dict = None) -> List[Insert]:
     if config.I2V_PROVIDER not in PROVIDERS:
         raise RuntimeError(
             f"Unknown I2V_PROVIDER={config.I2V_PROVIDER!r}. "
@@ -296,7 +335,10 @@ def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
         )
     print(f"[generate] provider={config.I2V_PROVIDER} slot={slot.id[:8]}", flush=True)
 
-    motion = ctx.motion_directive or "slow push-in with subtle cinematic drift"
+    motion = _style_motion(
+        video_meta or {},
+        ctx.motion_directive or "slow push-in with subtle cinematic drift",
+    )
     mood   = ctx.mood             or "cinematic"
     neg    = (
         ctx.negative_prompt
@@ -328,6 +370,8 @@ def generate_for_slot(slot: Slot, ctx: SceneContext) -> List[Insert]:
             f"Camera: {motion}. "
             f"Mood: {mood}. "
             f"Incoming source motion: {incoming_motion}. "
+            "Cinematic 3D motion, camera moves through the scene, high visual delta, realistic physics. "
+            "Project the starting image into a coherent 3D space and move a virtual camera through it. "
             "Keep the exact subject, location, era, wardrobe, architecture, lens feel, and color theme. "
             "Improve only what is broken: stabilize amateur motion, add subtle dimensional camera movement, "
             "and if the shot is very dark, naturally lift shadow detail while preserving believable highlights. "
