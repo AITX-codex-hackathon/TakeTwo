@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .env
+.env.local
+.env.*.local
 data/
 node_modules/
 dist/
