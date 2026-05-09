@@ -1,17 +1,11 @@
 """
-Stage 2: Analyze the anchor frame of a bad clip using a VLM.
-Describes what's wrong, the scene context, and suggests replacement prompts.
-Supports Google (Gemini), Anthropic (Claude), and OpenAI-compatible backends.
+Stage 2: Analyze the anchor frame using Gemini.
+Cached per anchor frame path so restarts skip the API call.
 """
-import base64
 import json
+import os
 from ..models.schemas import SceneContext
 from .. import config
-
-
-def _b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
 
 
 PROMPT = """
@@ -24,82 +18,49 @@ Analyze this frame and return JSON with:
   description: one-sentence description of what's happening in this scene
   issues_detail: explain specifically what quality problems you see
   mood: short phrase for the mood/tone (e.g. "warm sunset interview", "dark moody b-roll")
-  replacement_prompts: 2-3 prompts for generating a BETTER replacement clip of the
-    same scene/subject. Each prompt should describe a high-quality cinematic version of
-    what this clip was trying to show. Keep each under 30 words.
-  recommendation: "replace" if the scene content is worth keeping (just needs better quality),
-    or "cut" if the scene adds nothing and should be removed entirely.
+  replacement_prompts: 2-3 prompts for generating a BETTER cinematic replacement clip of the
+    same scene/subject. Each prompt should be photorealistic and cinematic. Under 30 words each.
+  recommendation: "replace" if the scene is worth keeping with better quality,
+    or "cut" if it adds nothing and should be removed entirely.
 
 Return ONLY valid JSON.
 """
 
 
-def _analyze_anthropic(anchor_path: str, issues: list) -> dict:
-    import anthropic
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    b64 = _b64(anchor_path)
-    resp = client.messages.create(
-        model=config.VLM_MODEL,
-        max_tokens=500,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": PROMPT.format(issues=", ".join(issues))},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-            ],
-        }],
-    )
-    text = resp.content[0].text
-    text = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
-
-
-def _analyze_openai(anchor_path: str, issues: list) -> dict:
-    from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
-    b64 = _b64(anchor_path)
-    resp = client.chat.completions.create(
-        model=config.VLM_MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": PROMPT.format(issues=", ".join(issues))},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Analyze this frame."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]},
-        ],
-        max_tokens=500,
-    )
-    text = resp.choices[0].message.content.replace("```json", "").replace("```", "")
-    return json.loads(text)
-
-
-def _analyze_vertexai(anchor_path: str, issues: list) -> dict:
-    import vertexai
-    from vertexai.generative_models import GenerativeModel, Part, Image
-    vertexai.init(project=config.VERTEXAI_PROJECT, location=config.VERTEXAI_LOCATION)
-    model = GenerativeModel(config.VLM_MODEL)
-    with open(anchor_path, "rb") as f:
-        img_bytes = f.read()
-    resp = model.generate_content([
-        PROMPT.format(issues=", ".join(issues)),
-        Part.from_data(data=img_bytes, mime_type="image/png"),
-    ])
-    text = resp.text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
+def _cache_path(anchor_path: str) -> str:
+    name = os.path.splitext(os.path.basename(anchor_path))[0]
+    return str(config.CACHE / f"analyze_{name}.json")
 
 
 def analyze_anchor(anchor_path: str, issues: list) -> SceneContext:
+    cache_file = _cache_path(anchor_path)
+    if os.path.exists(cache_file):
+        print(f"[analyze] using cached analysis (skipping Gemini call)", flush=True)
+        with open(cache_file) as f:
+            d = json.load(f)
+        return SceneContext.from_dict(d)
+
+    print(f"[analyze] calling Gemini to analyze frame, issues={issues}", flush=True)
+    from google import genai
+    from google.genai import types
     try:
-        if config.VLM_PROVIDER == "vertexai":
-            d = _analyze_vertexai(anchor_path, issues)
-        elif config.VLM_PROVIDER == "anthropic":
-            d = _analyze_anthropic(anchor_path, issues)
-        else:
-            d = _analyze_openai(anchor_path, issues)
+        client = genai.Client(api_key=config.GOOGLE_API_KEY)
+        with open(anchor_path, "rb") as f:
+            img_bytes = f.read()
+        resp = client.models.generate_content(
+            model=config.VLM_MODEL,
+            contents=[
+                PROMPT.format(issues=", ".join(issues)),
+                types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+            ],
+        )
+        text = resp.text.replace("```json", "").replace("```", "").strip()
+        d = json.loads(text)
+        print(f"[analyze] Gemini: description={d.get('description')} recommendation={d.get('recommendation')}", flush=True)
+        with open(cache_file, "w") as f:
+            json.dump(d, f)
     except Exception as e:
-        print(f"[analyze] VLM error: {e}")
+        print(f"[analyze] ERROR: Gemini call failed: {e}", flush=True)
         d = {}
 
     return SceneContext(
