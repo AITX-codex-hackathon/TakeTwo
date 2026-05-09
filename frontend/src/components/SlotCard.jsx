@@ -6,7 +6,6 @@ import {
   Scissors,
   Sparkles,
   Play,
-  Sparkles,
 } from "lucide-react";
 import { fileUrl } from "../api";
 

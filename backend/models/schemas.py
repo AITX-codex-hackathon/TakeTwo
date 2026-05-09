@@ -85,6 +85,7 @@ class Job:
     inserts: List[Insert] = field(default_factory=list)
     output_path: Optional[str] = None
     error: Optional[str] = None
+    logs: list = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
@@ -97,6 +98,7 @@ class Job:
             status=d.get("status", "queued"),
             output_path=d.get("output_path"),
             error=d.get("error"),
+            logs=d.get("logs", []),
         )
         job.slots = [Slot.from_dict(s) for s in d.get("slots", [])]
         job.inserts = [Insert.from_dict(i) for i in d.get("inserts", [])]

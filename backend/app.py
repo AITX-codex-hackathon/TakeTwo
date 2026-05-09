@@ -27,6 +27,12 @@ CORS(app)
 jobs.load_all()
 
 
+def _log(job, agent: str, msg: str):
+    import time
+    job.logs.append({"agent": agent, "msg": msg, "ts": time.time()})
+    jobs.save(job)
+
+
 def _process(job_id: str):
     job = jobs.get(job_id)
     if not job:
@@ -34,22 +40,29 @@ def _process(job_id: str):
     try:
         print(f"[job {job_id[:8]}] stage=detecting", flush=True)
         job.status = "detecting"
-        jobs.save(job)
+        _log(job, "angel", "I'm scanning your footage frame by frame, hunting for blurry shots, awkward pauses, and visual quality issues...")
         job.slots = detect.find_bad_clips(job.source_path)
-        print(f"[job {job_id[:8]}] detected {len(job.slots)} slot(s)", flush=True)
+        n = len(job.slots)
+        print(f"[job {job_id[:8]}] detected {n} slot(s)", flush=True)
 
         if not job.slots:
+            _log(job, "angel", "Great news — I scanned every frame and your footage looks clean! No bad clips detected.")
             job.status = "review"
             jobs.save(job)
             return
+
+        _log(job, "angel", f"Found {n} clip{'s' if n != 1 else ''} that need attention. Let me dig deeper into each one...")
 
         job.status = "analyzing"
         jobs.save(job)
         slot_contexts = {}
         for i, slot in enumerate(job.slots):
             print(f"[job {job_id[:8]}] analyzing slot {i+1}/{len(job.slots)}", flush=True)
+            issues_str = ", ".join(slot.issues) if slot.issues else "quality issues"
+            _log(job, "angel", f"Examining clip {i+1}/{n} ({issues_str})... reading the scene composition and emotional tone.")
             ctx = analyze.analyze_anchor(slot.anchor_frame_path, slot.issues)
             print(f"[job {job_id[:8]}] → recommendation={ctx.recommendation} mood={ctx.mood}", flush=True)
+            _log(job, "angel", f"Analysis done. Mood: {ctx.mood}. My recommendation: {'replace with something better ✨' if ctx.recommendation == 'replace' else 'cut this clip entirely ✂️'}.")
             slot_contexts[slot.id] = ctx
 
         job.status = "generating"
@@ -59,6 +72,7 @@ def _process(job_id: str):
             ctx = slot_contexts[slot.id]
             print(f"[job {job_id[:8]}] generating slot {i+1}/{len(job.slots)} ({ctx.recommendation})", flush=True)
             if ctx.recommendation == "cut":
+                _log(job, "angel", f"Clip {i+1} is beyond saving — I'm flagging it for removal. Sometimes less is more.")
                 job.inserts.append(Insert(
                     id=new_id(), slot_id=slot.id, clip_path="", prompt="",
                     label="AI recommends cutting this clip", status="pending",
@@ -66,22 +80,31 @@ def _process(job_id: str):
                 jobs.save(job)
                 continue
 
+            _log(job, "angel", f"Generating cinematic replacement for clip {i+1}... photorealistic 4K, ARRI camera style, smooth motion. This takes ~2–3 minutes per clip ⏳")
             inserts = generate.generate_for_slot(slot, ctx)
             for ins in inserts:
                 try:
+                    _log(job, "devil", f"My turn 😈 Let me see if this replacement actually fits the original scene...")
                     critic.review(ins, slot.anchor_frame_path, slot.issues)
                     print(f"[job {job_id[:8]}] critic pass={ins.critic_pass}: {ins.critic_notes}", flush=True)
+                    if ins.critic_pass:
+                        _log(job, "devil", f"Fine... I'll admit it — this one passes. {ins.critic_notes or 'Looks consistent with the original.'} ✅")
+                    else:
+                        _log(job, "devil", f"Nice try, but I'm flagging this one ❌ — {ins.critic_notes or 'does not match the scene well enough.'}")
                 except Exception as e:
                     ins.critic_notes = f"critic error: {e}"
+                    _log(job, "devil", f"Something went wrong during my review: {e}")
                 job.inserts.append(ins)
             jobs.save(job)
 
         job.status = "review"
         jobs.save(job)
+        _log(job, "angel", f"All done! 🎬 {len(job.inserts)} replacement option(s) are ready. Head to the review panel to make your decisions.")
         print(f"[job {job_id[:8]}] done — {len(job.inserts)} insert(s) ready", flush=True)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
+        _log(job, "devil", f"Something broke in the pipeline 💀 — {str(e)}")
         jobs.save(job)
         import traceback
         print(f"[job {job_id[:8]}] PIPELINE ERROR: {e}", flush=True)
