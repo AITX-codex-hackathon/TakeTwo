@@ -9,6 +9,11 @@ export async function uploadVideo(file) {
 
 export async function getJob(jobId) {
   const res = await fetch(`${BASE}/jobs/${jobId}`);
+  if (!res.ok) {
+    const err = new Error(`${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   return res.json();
 }
 
