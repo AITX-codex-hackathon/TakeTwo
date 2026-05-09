@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Mail, Lock, UserCircle, Film, ArrowRight } from "lucide-react";
+import { Mail, Lock, UserCircle, Film, ArrowRight, Eye, EyeOff } from "lucide-react";
 import { auth, googleProvider } from "../firebase";
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup } from "firebase/auth";
 
@@ -8,6 +8,7 @@ export default function Login({ onLogin }) {
   const [password, setPassword] = useState("");
   const [isSignUp, setIsSignUp] = useState(false);
   const [error, setError] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -74,12 +75,24 @@ export default function Login({ onLogin }) {
           <div className="input-group">
             <Lock className="input-icon" size={20} />
             <input
-              type="password"
+              type={showPassword ? "text" : "password"}
               placeholder="Password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               required
             />
+            {password && (
+              <button
+                type="button"
+                className="eye-toggle"
+                onMouseDown={() => setShowPassword(true)}
+                onMouseUp={() => setShowPassword(false)}
+                onMouseLeave={() => setShowPassword(false)}
+                tabIndex={-1}
+              >
+                {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+              </button>
+            )}
           </div>
 
           <button type="submit" className="btn-primary login-btn">
