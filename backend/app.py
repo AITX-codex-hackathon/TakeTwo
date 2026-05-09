@@ -1,5 +1,5 @@
 """
-ClipCure API — AI Video Editor
+TakeTwo API — AI Video Editor
 Routes:
   POST /jobs                           upload video, kick off detection
   GET  /jobs/<id>                      job status + slots + inserts

@@ -54,7 +54,7 @@ export default function Login({ onLogin }) {
           <div className="logo-icon-wrapper">
             <Film size={32} className="logo-icon" />
           </div>
-          <h2>{isSignUp ? "Create Account" : "Welcome to CLIPCURE"}</h2>
+          <h2>{isSignUp ? "Create Account" : "Welcome to TakeTwo"}</h2>
           <p>{isSignUp ? "Sign up to start editing your videos" : "Sign in to edit your videos"}</p>
         </div>
 

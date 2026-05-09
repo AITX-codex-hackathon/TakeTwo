@@ -62,7 +62,7 @@ export default function Done({ jobId, outputPath, onReset }) {
 
         <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#9CA3AF", fontSize: 13 }}>
           <Sparkles size={14} />
-          Powered by CLIPCURE AI
+          Powered by TakeTwo AI
         </div>
       </div>
     </section>
