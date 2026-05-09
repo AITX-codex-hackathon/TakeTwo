@@ -24,54 +24,67 @@ from backend.pipeline import detect, analyze, generate, critic, splice
 app = Flask(__name__)
 CORS(app)
 
+jobs.load_all()
+
 
 def _process(job_id: str):
     job = jobs.get(job_id)
     if not job:
         return
     try:
+        print(f"[job {job_id[:8]}] stage=detecting", flush=True)
         job.status = "detecting"
+        jobs.save(job)
         job.slots = detect.find_bad_clips(job.source_path)
+        print(f"[job {job_id[:8]}] detected {len(job.slots)} slot(s)", flush=True)
 
         if not job.slots:
             job.status = "review"
+            jobs.save(job)
             return
 
         job.status = "analyzing"
+        jobs.save(job)
         slot_contexts = {}
-        for slot in job.slots:
+        for i, slot in enumerate(job.slots):
+            print(f"[job {job_id[:8]}] analyzing slot {i+1}/{len(job.slots)}", flush=True)
             ctx = analyze.analyze_anchor(slot.anchor_frame_path, slot.issues)
+            print(f"[job {job_id[:8]}] → recommendation={ctx.recommendation} mood={ctx.mood}", flush=True)
             slot_contexts[slot.id] = ctx
 
         job.status = "generating"
-        for slot in job.slots:
+        jobs.save(job)
+        from backend.models.schemas import Insert
+        for i, slot in enumerate(job.slots):
             ctx = slot_contexts[slot.id]
+            print(f"[job {job_id[:8]}] generating slot {i+1}/{len(job.slots)} ({ctx.recommendation})", flush=True)
             if ctx.recommendation == "cut":
-                cut_insert = new_id()
-                from backend.models.schemas import Insert
                 job.inserts.append(Insert(
-                    id=cut_insert,
-                    slot_id=slot.id,
-                    clip_path="",
-                    prompt="",
-                    label="AI recommends cutting this clip entirely",
-                    status="pending",
+                    id=new_id(), slot_id=slot.id, clip_path="", prompt="",
+                    label="AI recommends cutting this clip", status="pending",
                 ))
+                jobs.save(job)
                 continue
 
             inserts = generate.generate_for_slot(slot, ctx)
             for ins in inserts:
                 try:
                     critic.review(ins, slot.anchor_frame_path, slot.issues)
+                    print(f"[job {job_id[:8]}] critic pass={ins.critic_pass}: {ins.critic_notes}", flush=True)
                 except Exception as e:
                     ins.critic_notes = f"critic error: {e}"
                 job.inserts.append(ins)
+            jobs.save(job)
 
         job.status = "review"
+        jobs.save(job)
+        print(f"[job {job_id[:8]}] done — {len(job.inserts)} insert(s) ready", flush=True)
     except Exception as e:
         job.status = "error"
         job.error = str(e)
+        jobs.save(job)
         import traceback
+        print(f"[job {job_id[:8]}] PIPELINE ERROR: {e}", flush=True)
         traceback.print_exc()
 
 
@@ -144,4 +157,4 @@ def serve_file(jid, kind, name):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5050, debug=True)
+    app.run(host="0.0.0.0", port=5050, debug=True, use_reloader=False)

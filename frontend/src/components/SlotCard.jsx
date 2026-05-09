@@ -4,6 +4,7 @@ import {
   CheckCircle,
   XCircle,
   Scissors,
+  Sparkles,
   Play,
 } from "lucide-react";
 import { fileUrl } from "../api";
