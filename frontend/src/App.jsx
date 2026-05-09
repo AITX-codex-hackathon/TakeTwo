@@ -3,10 +3,11 @@ import { Film } from "lucide-react";
 import Upload from "./pages/Upload";
 import Review from "./pages/Review";
 import Done from "./pages/Done";
+import Login from "./pages/Login";
 
 export default function App() {
   const [jobId, setJobId] = useState(null);
-  const [page, setPage] = useState("upload");
+  const [page, setPage] = useState("login");
   const [outputPath, setOutputPath] = useState(null);
 
   function handleUploaded(id) {
@@ -25,13 +26,18 @@ export default function App() {
     setPage("upload");
   }
 
+  function handleLogin() {
+    setPage("upload");
+  }
+
   return (
     <div className="app-shell">
       <div className="top-bar">
         <Film size={24} style={{ color: "#818cf8" }} />
-        <h1>ClipCure</h1>
+        <h1>Take Two</h1>
       </div>
       <div className="main-content">
+        {page === "login" && <Login onLogin={handleLogin} />}
         {page === "upload" && <Upload onUploaded={handleUploaded} />}
         {page === "review" && <Review jobId={jobId} onDone={handleDone} />}
         {page === "done" && (
