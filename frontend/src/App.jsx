@@ -31,12 +31,21 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <div className="top-bar">
-        <Film size={24} style={{ color: "#818cf8" }} />
-        <h1>Take Two</h1>
-      </div>
-      <div className="main-content">
+    <div className={`app-shell ${page === "login" ? "auth-shell" : "editor-shell"}`}>
+      {page === "login" ? (
+        <div className="top-bar">
+          <Film size={24} style={{ color: "#818cf8" }} />
+          <h1>CLIPCURE</h1>
+        </div>
+      ) : (
+        <header className="editor-topnav">
+          <div className="looply-brand">
+            <span className="brand-mark"><Film size={19} /></span>
+            <strong>CLIPCURE</strong>
+          </div>
+        </header>
+      )}
+      <div className={page === "login" ? "main-content" : "editor-content"}>
         {page === "login" && <Login onLogin={handleLogin} />}
         {page === "upload" && <Upload onUploaded={handleUploaded} />}
         {page === "review" && <Review jobId={jobId} onDone={handleDone} />}
