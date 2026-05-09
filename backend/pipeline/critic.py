@@ -1,39 +1,26 @@
 """
-Stage 4: Quality critic. Compares original bad frame vs generated replacement frame.
-Checks if the replacement is actually better and maintains scene continuity.
+Stage 4: Quality critic using GPT-4o.
+Compares original bad frame vs generated replacement.
 """
-import base64
 import json
+import base64
 import cv2
 import os
 from ..models.schemas import Insert
 from .. import config
 
 
-PROMPT = """
-You are a video quality critic. You'll see two images:
-  IMAGE A: a frame from the ORIGINAL clip that was flagged as bad quality
-  IMAGE B: first frame of an AI-GENERATED replacement clip
+PROMPT = """You are a video quality critic comparing two frames.
+  IMAGE A: original clip flagged as bad quality
+  IMAGE B: AI-generated cinematic replacement
 
-The original was flagged for: {issues}
+Original was flagged for: {issues}
 
-Evaluate whether the replacement is an improvement. Return JSON:
-{{
-  "better_quality": true/false,
-  "maintains_scene": true/false,
-  "artifacts": true/false,
-  "natural_looking": true/false,
-  "pass": true/false,
-  "notes": "short explanation"
-}}
+Return JSON:
+{{"better_quality": true/false, "maintains_scene": true/false, "artifacts": true/false,
+  "natural_looking": true/false, "pass": true/false, "notes": "short explanation"}}
 
-"pass" = true means IMAGE B is a clear improvement over IMAGE A and safe to use.
-"""
-
-
-def _b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+"pass" = true means IMAGE B is a clear improvement and safe to use."""
 
 
 def _first_frame(clip_path: str, out_path: str) -> str:
@@ -51,55 +38,37 @@ def review(insert: Insert, anchor_path: str, issues: list) -> Insert:
     _first_frame(insert.clip_path, first_path)
 
     issues_str = ", ".join(issues) if issues else "general quality"
+    print(f"[critic] calling GPT-4o to compare frames, issues={issues_str}", flush=True)
 
+    from openai import OpenAI
     try:
-        if config.VLM_PROVIDER == "anthropic":
-            d = _review_anthropic(anchor_path, first_path, issues_str)
-        else:
-            d = _review_openai(anchor_path, first_path, issues_str)
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        with open(anchor_path, "rb") as f:
+            b64_a = base64.b64encode(f.read()).decode()
+        with open(first_path, "rb") as f:
+            b64_b = base64.b64encode(f.read()).decode()
+        resp = client.chat.completions.create(
+            model=config.VLM_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT.format(issues=issues_str)},
+                    {"type": "text", "text": "Image A (original bad frame):"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_a}", "detail": "low"}},
+                    {"type": "text", "text": "Image B (AI replacement):"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_b}", "detail": "low"}},
+                ],
+            }],
+            max_tokens=300,
+            temperature=0,
+        )
+        text = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+        d = json.loads(text)
+        print(f"[critic] GPT-4o: pass={d.get('pass')} — {d.get('notes')}", flush=True)
     except Exception as e:
+        print(f"[critic] ERROR: {e}", flush=True)
         d = {"pass": False, "notes": f"critic error: {e}"}
 
     insert.critic_pass = bool(d.get("pass", False))
     insert.critic_notes = d.get("notes", "")
     return insert
-
-
-def _review_anthropic(anchor_path: str, gen_path: str, issues_str: str) -> dict:
-    import anthropic
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    resp = client.messages.create(
-        model=config.VLM_MODEL,
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": PROMPT.format(issues=issues_str)},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _b64(anchor_path)}},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _b64(gen_path)}},
-            ],
-        }],
-    )
-    text = resp.content[0].text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
-
-
-def _review_openai(anchor_path: str, gen_path: str, issues_str: str) -> dict:
-    from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
-    resp = client.chat.completions.create(
-        model=config.VLM_MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": PROMPT.format(issues=issues_str)},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Image A = original bad frame. Image B = generated replacement. Judge quality."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(anchor_path)}"}},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_b64(gen_path)}"}},
-            ]},
-        ],
-        max_tokens=300,
-    )
-    text = resp.choices[0].message.content.replace("```json", "").replace("```", "")
-    return json.loads(text)

@@ -1,88 +1,67 @@
 """
-Stage 2: Analyze the anchor frame of a bad clip using a VLM.
-Describes what's wrong, the scene context, and suggests replacement prompts.
-Supports Anthropic (Claude) and OpenAI-compatible backends.
+Stage 2: Analyze the anchor frame using GPT-4o.
+Cached per anchor frame so restarts skip the API call.
 """
-import base64
 import json
+import base64
+import os
 from ..models.schemas import SceneContext
 from .. import config
 
 
-def _b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-PROMPT = """
-You are a professional video editor's AI assistant analyzing a frame from a video clip
-that has been flagged for quality issues.
+PROMPT = """You are a professional video editor's AI assistant analyzing a frame flagged for quality issues.
 
 The detected issues are: {issues}
 
-Analyze this frame and return JSON with:
+Return JSON with:
   description: one-sentence description of what's happening in this scene
   issues_detail: explain specifically what quality problems you see
   mood: short phrase for the mood/tone (e.g. "warm sunset interview", "dark moody b-roll")
-  replacement_prompts: 2-3 prompts for generating a BETTER replacement clip of the
-    same scene/subject. Each prompt should describe a high-quality cinematic version of
-    what this clip was trying to show. Keep each under 30 words.
-  recommendation: "replace" if the scene content is worth keeping (just needs better quality),
-    or "cut" if the scene adds nothing and should be removed entirely.
+  replacement_prompts: 2-3 prompts for generating a BETTER cinematic replacement clip.
+    Each should be photorealistic and cinematic. Under 30 words each.
+  recommendation: "replace" if worth keeping with better quality, "cut" if it adds nothing.
 
-Return ONLY valid JSON.
-"""
+Return ONLY valid JSON."""
 
 
-def _analyze_anthropic(anchor_path: str, issues: list) -> dict:
-    import anthropic
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    b64 = _b64(anchor_path)
-    resp = client.messages.create(
-        model=config.VLM_MODEL,
-        max_tokens=500,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": PROMPT.format(issues=", ".join(issues))},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-            ],
-        }],
-    )
-    text = resp.content[0].text
-    text = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
-
-
-def _analyze_openai(anchor_path: str, issues: list) -> dict:
-    from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
-    b64 = _b64(anchor_path)
-    resp = client.chat.completions.create(
-        model=config.VLM_MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": PROMPT.format(issues=", ".join(issues))},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Analyze this frame."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]},
-        ],
-        max_tokens=500,
-    )
-    text = resp.choices[0].message.content.replace("```json", "").replace("```", "")
-    return json.loads(text)
+def _cache_path(anchor_path: str) -> str:
+    name = os.path.splitext(os.path.basename(anchor_path))[0]
+    return str(config.CACHE / f"analyze_{name}.json")
 
 
 def analyze_anchor(anchor_path: str, issues: list) -> SceneContext:
+    cache_file = _cache_path(anchor_path)
+    if os.path.exists(cache_file):
+        print(f"[analyze] using cached analysis", flush=True)
+        with open(cache_file) as f:
+            d = json.load(f)
+        return SceneContext.from_dict(d)
+
+    print(f"[analyze] calling GPT-4o, issues={issues}", flush=True)
+    from openai import OpenAI
     try:
-        if config.VLM_PROVIDER == "anthropic":
-            d = _analyze_anthropic(anchor_path, issues)
-        else:
-            d = _analyze_openai(anchor_path, issues)
+        client = OpenAI(api_key=config.OPENAI_API_KEY)
+        with open(anchor_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        resp = client.chat.completions.create(
+            model=config.VLM_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT.format(issues=", ".join(issues))},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}},
+                ],
+            }],
+            max_tokens=600,
+            temperature=0,
+        )
+        text = resp.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+        d = json.loads(text)
+        print(f"[analyze] GPT-4o: {d.get('description')} → {d.get('recommendation')}", flush=True)
+        with open(cache_file, "w") as f:
+            json.dump(d, f)
     except Exception as e:
-        print(f"[analyze] VLM error: {e}")
+        print(f"[analyze] ERROR: {e}", flush=True)
         d = {}
 
     return SceneContext(

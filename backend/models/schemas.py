@@ -17,6 +17,18 @@ class Slot:
     def duration_sec(self) -> float:
         return (self.end_frame - self.start_frame + 1) / self.fps
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Slot":
+        return cls(
+            id=d["id"],
+            start_frame=d["start_frame"],
+            end_frame=d["end_frame"],
+            fps=d["fps"],
+            quality_score=d["quality_score"],
+            anchor_frame_path=d["anchor_frame_path"],
+            issues=d.get("issues", []),
+        )
+
 
 @dataclass
 class SceneContext:
@@ -25,6 +37,16 @@ class SceneContext:
     mood: str
     replacement_prompts: List[str] = field(default_factory=list)
     recommendation: Literal["replace", "cut"] = "replace"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SceneContext":
+        return cls(
+            description=d["description"],
+            issues_detail=d["issues_detail"],
+            mood=d["mood"],
+            replacement_prompts=d.get("replacement_prompts", []),
+            recommendation=d.get("recommendation", "replace"),
+        )
 
 
 @dataclass
@@ -37,6 +59,19 @@ class Insert:
     critic_pass: bool = False
     critic_notes: str = ""
     status: Literal["pending", "approved", "rejected", "cut", "applied"] = "pending"
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Insert":
+        return cls(
+            id=d["id"],
+            slot_id=d["slot_id"],
+            clip_path=d["clip_path"],
+            prompt=d["prompt"],
+            label=d["label"],
+            critic_pass=d.get("critic_pass", False),
+            critic_notes=d.get("critic_notes", ""),
+            status=d.get("status", "pending"),
+        )
 
 
 @dataclass
@@ -53,6 +88,19 @@ class Job:
 
     def to_dict(self):
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Job":
+        job = cls(
+            id=d["id"],
+            source_path=d["source_path"],
+            status=d.get("status", "queued"),
+            output_path=d.get("output_path"),
+            error=d.get("error"),
+        )
+        job.slots = [Slot.from_dict(s) for s in d.get("slots", [])]
+        job.inserts = [Insert.from_dict(i) for i in d.get("inserts", [])]
+        return job
 
 
 def new_id() -> str:

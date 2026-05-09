@@ -4,6 +4,7 @@ import {
   CheckCircle,
   XCircle,
   Scissors,
+  Sparkles,
   Play,
   Sparkles,
 } from "lucide-react";
