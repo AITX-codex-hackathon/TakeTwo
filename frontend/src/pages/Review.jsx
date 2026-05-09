@@ -8,19 +8,36 @@ const POLL_MS = 2000;
 export default function Review({ jobId, onDone }) {
   const [job, setJob] = useState(null);
   const [applying, setApplying] = useState(false);
+  const [notFound, setNotFound] = useState(false);
 
   const poll = useCallback(() => {
-    getJob(jobId).then(setJob).catch(console.error);
+    getJob(jobId)
+      .then(setJob)
+      .catch((e) => {
+        if (e.status === 404 || (e.message && e.message.includes("404"))) {
+          setNotFound(true);
+        } else {
+          console.error(e);
+        }
+      });
   }, [jobId]);
 
   useEffect(() => {
+    if (notFound) return;
     poll();
-    const id = setInterval(() => {
-      if (job && (job.status === "review" || job.status === "done" || job.status === "error")) return;
-      poll();
-    }, POLL_MS);
+    const id = setInterval(poll, POLL_MS);
     return () => clearInterval(id);
-  }, [poll, job?.status]);
+  }, [poll, notFound]);
+
+  if (notFound) {
+    return (
+      <div className="empty-state">
+        <AlertTriangle size={40} style={{ color: "#f87171", marginBottom: 12 }} />
+        <h3>Session expired</h3>
+        <p>This job no longer exists — the server may have restarted. Please re-upload your video.</p>
+      </div>
+    );
+  }
 
   if (!job) return null;
 
