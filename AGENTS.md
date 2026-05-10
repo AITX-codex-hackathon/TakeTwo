@@ -1,4 +1,4 @@
-# ClipCure
+# TakeTwo
 
 AI video editor: detects bad clips → generates AI replacements → user reviews → exports.
 

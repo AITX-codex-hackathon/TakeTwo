@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "=== ClipCure — AI Video Editor ==="
+echo "=== TakeTwo — AI Video Editor ==="
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_PYTHON="$DIR/backend/venv/bin/python"

@@ -35,13 +35,13 @@ export default function App() {
       {page === "login" ? (
         <div className="top-bar">
           <Film size={24} style={{ color: "#818cf8" }} />
-          <h1>CLIPCURE</h1>
+          <h1>TAKETWO</h1>
         </div>
       ) : (
         <header className="editor-topnav">
           <div className="looply-brand">
             <span className="brand-mark"><Film size={19} /></span>
-            <strong>CLIPCURE</strong>
+            <strong>TAKETWO</strong>
           </div>
         </header>
       )}

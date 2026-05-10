@@ -84,7 +84,7 @@ export default function Upload({ onUploaded }) {
     {
       id: makeId(),
       role: "assistant",
-      text: "Hi! I'm your CLIPCURE assistant. Drop a video in the center and hit Analyze — I'll find bad clips and generate cinematic replacements.",
+      text: "Hi! I'm your TAKETWO assistant. Drop a video in the center and hit Analyze — I'll find bad clips and generate cinematic replacements.",
     },
   ]);
 
@@ -275,7 +275,7 @@ export default function Upload({ onUploaded }) {
         <div className="panel-heading">
           <div>
             <p>AI Assistant</p>
-            <h2>Chat with CLIPCURE</h2>
+            <h2>Chat with TAKETWO</h2>
           </div>
           <Bot size={22} />
         </div>
