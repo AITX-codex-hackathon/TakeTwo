@@ -76,9 +76,16 @@ the shot as a subtle cinematic sequence that still belongs to this exact video.
 The replacement MUST match the incoming camera velocity for the first few
 frames, then gradually ramp into motivated 3D movement. Avoid excessive action.
 If the source is underexposed, lift shadows naturally, preserve believable
-highlights, and keep the scene mood. A static replacement is a failed
-replacement. Even "still" shots must have small real-world motion: breathing,
-cloth, leaves, dust, light, reflections, or handheld drift.
+highlights, protect black levels, and keep the scene mood. It should feel like
+real exposure, bounce fill, window light, or practical-light correction — never
+fake HDR, glowing halos, neon relighting, beauty-filter skin, or glossy AI
+polish. If the problem is a random still image or dead-air filler inside a
+moving video, give it motivated living movement and spatial depth while keeping
+the exact subject and setting. Do not turn a still photo into a simple Ken Burns
+pan; create believable spatial motion and subject/environment micro-action. A
+static replacement is a failed replacement. Even "still" shots must have small
+real-world motion: breathing, cloth, leaves, dust, light, reflections, or
+handheld drift.
 
 Frames, when provided:
   FRAME A1–A6 — optional lead-in frames immediately before the replacement start
@@ -92,10 +99,10 @@ Return ONLY valid JSON:
   "mood": "precise mood phrase from what you SEE + the handover motion, e.g. 'golden hour street, matching left pan into slow 3D push-in'",
   "replacement_prompts": [
     "Prompt 1 — ground truth: actual subject/setting visible in B, {color_palette} tones, {lighting} lighting, subtle photoreal cinematic improvement, MUST include the initial velocity match and gradual cinematic ramp. Under 50 words.",
-    "Prompt 2 — same subject and location as frames, improved exposure if dark, different but compatible cinematic angle or moment, MUST cover the full handover duration and end cleanly. Under 50 words.",
+    "Prompt 2 — same subject and location as frames, naturally lifted exposure if dark, different but compatible cinematic angle or moment, MUST cover the full handover duration and end cleanly. Under 50 words.",
     "Prompt 3 — most elevated but restrained Director's Cut interpretation of the actual scene. Same subject/location/theme, natural light improvement, realistic motion, no cartoon look. Under 50 words."
   ],
-  "negative_prompt": "static shot, frozen frame, no camera movement, cartoon, CGI, animation, anime, plastic skin, over-sharpened, oversaturated, surreal, text overlays, watermarks, wrong subject matter",
+  "negative_prompt": "static shot, frozen frame, no camera movement, cartoon, CGI, animation, anime, plastic skin, waxy skin, fake HDR, glowing halos, neon relighting, over-denoised, over-sharpened, oversaturated, surreal, text overlays, watermarks, wrong subject matter",
   "motion_directive": "{motion_directive}",
   "recommendation": "replace or cut — cut only if the scene content adds zero narrative value to a {video_type} video"
 }}"""
@@ -160,7 +167,7 @@ def _transition_context(slot: Optional[Slot], fallback_motion: str) -> dict:
 
 def _cache_path(anchor_path: str) -> str:
     name = os.path.splitext(os.path.basename(anchor_path))[0]
-    return str(config.CACHE / f"analyze_v4_i{config.OPENAI_MAX_IMAGES_PER_REQUEST}_{name}.json")
+    return str(config.CACHE / f"analyze_v5_i{config.OPENAI_MAX_IMAGES_PER_REQUEST}_{name}.json")
 
 
 def _extract_frame_at(video_path: str, timestamp: float) -> str:

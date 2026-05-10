@@ -45,7 +45,7 @@ def _video_hash(path: str) -> str:
 def _cache_path(video_path: str) -> str:
     return str(
         config.CACHE
-        / f"{_video_hash(video_path)}_detect_v3_i{config.OPENAI_MAX_IMAGES_PER_REQUEST}.json"
+        / f"{_video_hash(video_path)}_detect_v4_i{config.OPENAI_MAX_IMAGES_PER_REQUEST}.json"
     )
 
 
@@ -144,6 +144,7 @@ def _local_score_frame(video_path: str, timestamp: float) -> Optional[dict]:
         brightness = float(gray.mean()) / 255.0
         contrast = float(gray.std())
         blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        motion_delta = _local_motion_delta(video_path, timestamp)
 
         score = 0.85
         issues = []
@@ -163,6 +164,20 @@ def _local_score_frame(video_path: str, timestamp: float) -> Optional[dict]:
             issues.append("blurry")
             notes.append("low sharpness")
 
+        if motion_delta is not None:
+            if motion_delta < 1.8 and brightness >= 0.08:
+                score -= 0.26
+                issues.append("dead_air")
+                notes.append("nearly frozen frame")
+            elif motion_delta > 26 and blur < 95:
+                score -= 0.20
+                issues.append("messy_motion")
+                notes.append("chaotic motion blur")
+            elif motion_delta > 16 and blur < 55:
+                score -= 0.16
+                issues.append("motion_blur")
+                notes.append("motion-soft frame")
+
         if contrast < 28:
             score -= 0.18
             issues.append("flat_light")
@@ -177,12 +192,44 @@ def _local_score_frame(video_path: str, timestamp: float) -> Optional[dict]:
             "cinematic_score": max(0.1, min(0.95, score)),
             "issues": issues,
             "reason": ", ".join(notes),
+            "motion_delta": motion_delta,
         }
     except Exception:
         return None
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+def _local_motion_delta(video_path: str, timestamp: float) -> Optional[float]:
+    """Mean frame delta around timestamp; low means dead still, high+blur means messy motion."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    frames = []
+    for ts in (max(0.0, timestamp - 0.35), timestamp, timestamp + 0.35):
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            _extract_frame(video_path, ts, tmp_path)
+            img = cv2.imread(tmp_path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                frames.append(cv2.resize(img, (160, 90)))
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    if len(frames) < 2:
+        return None
+
+    deltas = []
+    for a, b in zip(frames, frames[1:]):
+        deltas.append(float(cv2.absdiff(a, b).mean()))
+    return sum(deltas) / len(deltas)
 
 
 def _frame_quality(video_path: str, timestamp: float) -> Optional[dict]:
@@ -242,11 +289,29 @@ def _select_anchor_timestamp(video_path: str, start_ts: float, end_ts: float,
 
 def _local_find_worst(video_path: str, timestamps: List[float], max_clips: int) -> List[dict]:
     candidates = []
+    motion_deltas = []
     for i, ts in enumerate(timestamps):
         result = _local_score_frame(video_path, ts)
         if result:
             result["frame_index"] = i
+            if result.get("motion_delta") is not None:
+                motion_deltas.append(float(result["motion_delta"]))
             candidates.append(result)
+
+    if motion_deltas:
+        ordered = sorted(motion_deltas)
+        median_motion = ordered[len(ordered) // 2]
+        if median_motion > 8.0:
+            for result in candidates:
+                issues = result.get("issues") or []
+                if "dead_air" in issues and (result.get("motion_delta") or 0.0) < 2.0:
+                    result["cinematic_score"] = max(
+                        0.1,
+                        float(result.get("cinematic_score", 1.0)) - 0.12,
+                    )
+                    reason = result.get("reason") or ""
+                    suffix = "dead still compared to the rest of the moving video"
+                    result["reason"] = f"{reason}, {suffix}" if reason else suffix
 
     candidates.sort(key=lambda r: float(r.get("cinematic_score", 1.0)))
     selected = candidates[:max_clips]
@@ -461,10 +526,19 @@ def _gpt_find_worst(video_path: str, timestamps: List[float],
             "grainy, out of focus, compression artifacts\n"
             "  DEAD AIR    — static shot with zero camera movement AND zero subject action "
             "(nothing is happening, no narrative purpose)\n"
+            "  RANDOM STILL — a frame that feels like a dropped-in still photo or frozen filler, "
+            "especially inside an otherwise moving video\n"
+            "  BAD MOTION   — chaotic motion blur, accidental whip/shake, or smeared movement that "
+            "does not feel intentional or cinematic\n"
+            "  FIXABLE DARK — underexposed scenes where the subject/setting is worth saving with "
+            "natural exposure and practical-light correction; do not flag intentional low-key "
+            "cinema if the subject, mood, and silhouette are clear\n"
             "  FLAT LIGHT  — uninspiring, muddy, or flat lighting with no mood, depth, or drama\n"
             "  WEAK FRAME  — centered boring composition, no leading lines, no depth, no "
             "cinematic intent\n"
             "  VLOG TRAP   — accidental handheld shake that looks amateur, not stylistic\n\n"
+            "When slots are limited, prioritize RANDOM STILL, BAD MOTION, and FIXABLE DARK "
+            "above generic weak framing or merely average shots.\n\n"
             "Return ONLY a JSON array (0–{max_clips} entries), lowest cinematic score first.\n"
             "If all frames score ≥ 0.6, return [].\n"
             '[{"frame_index": 3, "timestamp": 15.0, "cinematic_score": 0.3, '

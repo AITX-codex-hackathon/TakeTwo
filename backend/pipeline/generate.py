@@ -377,7 +377,9 @@ def generate_for_slot(slot: Slot, ctx: SceneContext, video_meta: dict = None) ->
     neg = (
         f"{neg}, slideshow, still image, Ken Burns effect, fake parallax, "
         "cartoon, anime, CGI, plastic skin, waxy faces, oversaturated colors, "
-        "surreal objects, wrong subject, wrong location, text, subtitles, logo, watermark"
+        "fake HDR, AI-looking relight, glowing halos, neon relighting, beauty filter, "
+        "over-denoised, synthetic bokeh, surreal objects, wrong subject, wrong location, "
+        "text, subtitles, logo, watermark"
     )
     duration_s = _generation_duration(slot)
     replaced_s = getattr(slot, "replacement_duration_sec", slot.duration_sec)
@@ -408,11 +410,12 @@ def generate_for_slot(slot: Slot, ctx: SceneContext, video_meta: dict = None) ->
             "Project the starting image into a coherent 3D space and move a virtual camera through it. "
             "Keep the exact subject, location, era, wardrobe, architecture, lens feel, and color theme. "
             "Improve only what is broken: stabilize amateur motion, add subtle dimensional camera movement, "
-            "and if the shot is very dark, naturally lift shadow detail while preserving believable highlights. "
+            "and if the shot is very dark, lift exposure like available practical light or soft bounce fill, "
+            "preserving black levels, highlight rolloff, natural color temperature, and real skin texture. "
             "Keep scene alive with restrained real-world micro-motion: breathing, cloth, dust, reflections, "
             "wind, or shifting practical light. Photorealistic live-action footage, natural skin texture, "
             "real lens optics, physically plausible lighting, smooth cinematic motion, no compression artifacts. "
-            "Do not make it cartoonish, surreal, glossy, over-stylized, or unrelated. "
+            "Do not make it cartoonish, surreal, glossy, fake-HDR, over-stylized, or unrelated. "
             "End on a composition that fits the next original frame or hard-cuts cleanly into it."
         )
         print(f"[generate] prompt {i}/{generation_count}: {full_prompt[:140]}...", flush=True)
