@@ -19,13 +19,22 @@ cfg_scale = 0.7:
   At 0.7 they become mandates.
 """
 import os
+import re
 import time
 import requests
+import threading
+import shutil
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List
 
 from ..models.schemas import Slot, SceneContext, Insert, new_id
 from .. import config
 from .api_utils import retry_api
+
+
+_FAL_SEMAPHORE = threading.Semaphore(config.FAL_CONCURRENCY)
 
 
 # ─── upscale helper ─────────────────────────────────────────────────────────
@@ -59,6 +68,39 @@ def _configure_fal():
 
 
 # ─── providers ──────────────────────────────────────────────────────────────
+
+def _poll_fal_result(handler, label: str):
+    """Wait for a fal.ai job, but never forever."""
+    from fal_client.client import Completed
+
+    timeout_s = max(30, config.FAL_GENERATION_TIMEOUT_SEC)
+    poll_s = max(1.0, config.FAL_POLL_INTERVAL_SEC)
+    start = time.time()
+    last_state = ""
+
+    while True:
+        elapsed = int(time.time() - start)
+        if elapsed > timeout_s:
+            raise TimeoutError(
+                f"{label} did not finish after {timeout_s}s. "
+                "The provider may be queued or stuck; retry the upload or switch I2V_PROVIDER=stub for local testing."
+            )
+
+        status = handler.status(with_logs=True)
+        state = type(status).__name__
+        if state != last_state or elapsed % max(1, int(poll_s * 4)) == 0:
+            print(f"[generate/{label}] {elapsed}s - {state}", flush=True)
+            last_state = state
+        if hasattr(status, "logs") and status.logs:
+            for log in status.logs:
+                print(f"[generate/{label}]   {log.get('message', log)}", flush=True)
+        if isinstance(status, Completed):
+            if status.error:
+                raise RuntimeError(f"{label} generation failed: {status.error}")
+            return int(time.time() - start)
+
+        time.sleep(poll_s)
+
 
 def _gen_stub(anchor_path: str, prompt: str, neg_prompt: str, out_path: str,
               duration_s: int, end_frame_path: str = "") -> str:
@@ -117,26 +159,12 @@ def _gen_fal_kling_v3(anchor_path: str, prompt: str, neg_prompt: str,
         arguments=arguments,
     )
 
-    from fal_client.client import Completed
     print("[generate/kling-v3] queued — polling for result...", flush=True)
-    start = time.time()
-    while True:
-        status = handler.status(with_logs=True)
-        elapsed = int(time.time() - start)
-        state = type(status).__name__
-        print(f"[generate/kling-v3] {elapsed}s — {state}", flush=True)
-        if hasattr(status, "logs") and status.logs:
-            for log in status.logs:
-                print(f"[generate/kling-v3]   {log.get('message', log)}", flush=True)
-        if isinstance(status, Completed):
-            if status.error:
-                raise RuntimeError(f"Kling v3 generation failed: {status.error}")
-            break
-        time.sleep(8)
+    elapsed = _poll_fal_result(handler, "kling-v3")
 
     result    = handler.get()
     video_url = result["video"]["url"]
-    print(f"[generate/kling-v3] done ({int(time.time()-start)}s) — downloading...", flush=True)
+    print(f"[generate/kling-v3] done ({elapsed}s) — downloading...", flush=True)
 
     resp = requests.get(video_url, timeout=240)
     resp.raise_for_status()
@@ -182,26 +210,12 @@ def _gen_fal_kling_v21(anchor_path: str, prompt: str, neg_prompt: str,
     # Poll with progress logging — Kling typically queues for 10-30s then runs 45-90s
     # fal_client 1.0: statuses are Queued / InProgress / Completed (no Failed class).
     # Completed.error is set on failure.
-    from fal_client.client import Completed
     print("[generate/kling] queued — polling for result...", flush=True)
-    start = time.time()
-    while True:
-        status = handler.status(with_logs=True)
-        elapsed = int(time.time() - start)
-        state = type(status).__name__
-        print(f"[generate/kling] {elapsed}s — {state}", flush=True)
-        if hasattr(status, "logs") and status.logs:
-            for log in status.logs:
-                print(f"[generate/kling]   {log.get('message', log)}", flush=True)
-        if isinstance(status, Completed):
-            if status.error:
-                raise RuntimeError(f"Kling generation failed: {status.error}")
-            break
-        time.sleep(8)
+    elapsed = _poll_fal_result(handler, "kling")
 
     result    = handler.get()
     video_url = result["video"]["url"]
-    print(f"[generate/kling] done ({int(time.time()-start)}s) — downloading...", flush=True)
+    print(f"[generate/kling] done ({elapsed}s) — downloading...", flush=True)
 
     resp = requests.get(video_url, timeout=180)
     resp.raise_for_status()
@@ -239,23 +253,12 @@ def _gen_fal_luma(anchor_path: str, prompt: str, neg_prompt: str, out_path: str,
         },
     )
 
-    from fal_client.client import Completed
     print("[generate/luma] queued — polling...", flush=True)
-    start = time.time()
-    while True:
-        status = handler.status(with_logs=True)
-        elapsed = int(time.time() - start)
-        state = type(status).__name__
-        print(f"[generate/luma] {elapsed}s — {state}", flush=True)
-        if isinstance(status, Completed):
-            if status.error:
-                raise RuntimeError(f"Luma generation failed: {status.error}")
-            break
-        time.sleep(8)
+    elapsed = _poll_fal_result(handler, "luma")
 
     result    = handler.get()
     video_url = result["video"]["url"]
-    print(f"[generate/luma] done ({int(time.time()-start)}s) — downloading...", flush=True)
+    print(f"[generate/luma] done ({elapsed}s) — downloading...", flush=True)
 
     resp = requests.get(video_url, timeout=180)
     resp.raise_for_status()
@@ -319,6 +322,33 @@ def _style_motion(video_meta: dict, fallback_motion: str) -> str:
     return f"{base}. Movement style: {style}."
 
 
+def _clean_prompt_text(prompt_text: str) -> str:
+    return re.sub(r"^\s*prompt\s*\d+\s*[—:-]\s*", "", prompt_text or "", flags=re.I).strip()
+
+
+def _conform_clip_duration(path: str, duration_s: float):
+    """Trim or loop generated video so review/export clips match the slot length."""
+    if duration_s <= 0:
+        return
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        subprocess.run([
+            ffmpeg, "-y", "-stream_loop", "-1", "-i", path,
+            "-t", f"{duration_s:.6f}",
+            "-an", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", tmp_path,
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        os.replace(tmp_path, path)
+        print(f"[generate] conformed {os.path.basename(path)} to {duration_s:.3f}s", flush=True)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 # ─── entry point ────────────────────────────────────────────────────────────
 
 def generate_for_slot(slot: Slot, ctx: SceneContext, video_meta: dict = None) -> List[Insert]:
@@ -358,8 +388,12 @@ def generate_for_slot(slot: Slot, ctx: SceneContext, video_meta: dict = None) ->
     clean_cut = bool(transition and slot.resume_frame != slot.end_frame)
     end_frame_path = "" if clean_cut else getattr(slot, "resume_frame_path", "")
 
-    inserts = []
-    for i, prompt_text in enumerate(ctx.replacement_prompts[:2]):
+    generation_count = max(1, min(config.FAL_GENERATIONS_PER_SLOT, len(ctx.replacement_prompts)))
+    prompt_items = list(enumerate(ctx.replacement_prompts[:generation_count], start=1))
+
+    def _generate_prompt(item) -> tuple[int, Insert | None]:
+        i, prompt_text = item
+        prompt_text = _clean_prompt_text(prompt_text)
         iid      = new_id()
         out_path = os.path.join(config.CLIPS, f"{iid}.mp4")
 
@@ -381,27 +415,50 @@ def generate_for_slot(slot: Slot, ctx: SceneContext, video_meta: dict = None) ->
             "Do not make it cartoonish, surreal, glossy, over-stylized, or unrelated. "
             "End on a composition that fits the next original frame or hard-cuts cleanly into it."
         )
-        print(f"[generate] prompt {i+1}: {full_prompt[:140]}...", flush=True)
+        print(f"[generate] prompt {i}/{generation_count}: {full_prompt[:140]}...", flush=True)
         print(f"[generate] neg:    {neg[:80]}...", flush=True)
 
         if os.path.exists(out_path):
-            print(f"[generate] clip {i+1} already exists — skipping generation", flush=True)
+            print(f"[generate] clip {i} already exists — skipping generation", flush=True)
         else:
             try:
-                provider_fn(slot.anchor_frame_path, full_prompt, neg, out_path,
-                            duration_s, end_frame_path)
-                print(f"[generate] clip {i+1} saved → {os.path.basename(out_path)}", flush=True)
+                with _FAL_SEMAPHORE:
+                    provider_fn(slot.anchor_frame_path, full_prompt, neg, out_path,
+                                duration_s, end_frame_path)
+                _conform_clip_duration(out_path, replaced_s)
+                print(f"[generate] clip {i} saved → {os.path.basename(out_path)}", flush=True)
             except Exception as e:
-                print(f"[generate] ERROR clip {i+1}: {e}", flush=True)
-                continue
+                print(f"[generate] ERROR clip {i}: {e}", flush=True)
+                return i, None
 
-        inserts.append(Insert(
+        return i, Insert(
             id=iid,
             slot_id=slot.id,
             clip_path=out_path,
             prompt=full_prompt,
             label=prompt_text[:80],
-        ))
+        )
+
+    inserts = []
+    if generation_count == 1:
+        _, insert = _generate_prompt(prompt_items[0])
+        if insert:
+            inserts.append(insert)
+    else:
+        max_workers = max(1, min(config.FAL_CONCURRENCY, generation_count))
+        print(
+            f"[generate] launching {generation_count} prompt generation(s) "
+            f"with max_workers={max_workers}, fal_concurrency={config.FAL_CONCURRENCY}",
+            flush=True,
+        )
+        generated = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_generate_prompt, item) for item in prompt_items]
+            for fut in as_completed(futures):
+                idx, insert = fut.result()
+                if insert:
+                    generated.append((idx, insert))
+        inserts = [insert for _, insert in sorted(generated, key=lambda item: item[0])]
 
     if not inserts:
         raise RuntimeError(
