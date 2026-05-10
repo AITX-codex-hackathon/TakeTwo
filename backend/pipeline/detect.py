@@ -19,7 +19,7 @@ from typing import List, Tuple, Optional
 
 from ..models.schemas import Slot, SceneTransition, new_id
 from .. import config
-from .api_utils import retry_api, parse_json
+from .api_utils import retry_api, parse_json, wait_for_openai_image_slot
 
 INTERVAL_SHORT = 5.0
 INTERVAL_LONG  = 10.0
@@ -43,7 +43,30 @@ def _video_hash(path: str) -> str:
 
 
 def _cache_path(video_path: str) -> str:
-    return str(config.CACHE / f"{_video_hash(video_path)}_detect_v2.json")
+    return str(
+        config.CACHE
+        / f"{_video_hash(video_path)}_detect_v3_i{config.OPENAI_MAX_IMAGES_PER_REQUEST}.json"
+    )
+
+
+def _default_video_meta() -> dict:
+    return {
+        "video_type": "general",
+        "visual_style": "mixed",
+        "color_palette": "neutral",
+        "subject": "mixed",
+        "lighting": "mixed",
+        "description": "video footage",
+    }
+
+
+def _sample_evenly(items: List[float], max_count: int) -> List[float]:
+    if max_count <= 0 or len(items) <= max_count:
+        return items
+    if max_count == 1:
+        return [items[len(items) // 2]]
+    step = (len(items) - 1) / (max_count - 1)
+    return [items[round(i * step)] for i in range(max_count)]
 
 
 def _ffprobe(video_path: str) -> dict:
@@ -101,6 +124,144 @@ def extract_clip(video_path: str, start_frame: int, end_frame: int,
         "-an", "-movflags", "+faststart", out_path,
     ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_path
+
+
+def _local_score_frame(video_path: str, timestamp: float) -> Optional[dict]:
+    """Cheap local visual-quality pass for very low OpenAI image-rate projects."""
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        _extract_frame(video_path, timestamp, tmp_path)
+        img = cv2.imread(tmp_path)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        brightness = float(gray.mean()) / 255.0
+        contrast = float(gray.std())
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+        score = 0.85
+        issues = []
+        notes = []
+
+        if brightness < 0.18:
+            score -= 0.35
+            issues.append("underexposed")
+            notes.append("very dark")
+        elif brightness > 0.88:
+            score -= 0.30
+            issues.append("overexposed")
+            notes.append("very bright")
+
+        if blur < 65:
+            score -= 0.25
+            issues.append("blurry")
+            notes.append("low sharpness")
+
+        if contrast < 28:
+            score -= 0.18
+            issues.append("flat_light")
+            notes.append("flat contrast")
+
+        if not issues:
+            return None
+
+        return {
+            "frame_index": -1,
+            "timestamp": timestamp,
+            "cinematic_score": max(0.1, min(0.95, score)),
+            "issues": issues,
+            "reason": ", ".join(notes),
+        }
+    except Exception:
+        return None
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _frame_quality(video_path: str, timestamp: float) -> Optional[dict]:
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        _extract_frame(video_path, timestamp, tmp_path)
+        img = cv2.imread(tmp_path)
+        if img is None:
+            return None
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        brightness = float(gray.mean()) / 255.0
+        contrast = float(gray.std())
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        usable = brightness >= 0.08 and contrast >= 12
+        score = (brightness * 0.45) + (min(contrast / 80, 1.0) * 0.35) + (min(blur / 160, 1.0) * 0.2)
+        return {
+            "timestamp": timestamp,
+            "brightness": brightness,
+            "contrast": contrast,
+            "blur": blur,
+            "usable": usable,
+            "score": score,
+        }
+    except Exception:
+        return None
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _select_anchor_timestamp(video_path: str, start_ts: float, end_ts: float,
+                             preferred_ts: float) -> tuple[float, Optional[dict]]:
+    sample_count = 7
+    if end_ts <= start_ts:
+        quality = _frame_quality(video_path, preferred_ts)
+        return preferred_ts, quality
+
+    span = end_ts - start_ts
+    timestamps = [start_ts + (span * i / max(1, sample_count - 1)) for i in range(sample_count)]
+    if all(abs(preferred_ts - ts) > 0.05 for ts in timestamps):
+        timestamps.append(preferred_ts)
+
+    qualities = [q for q in (_frame_quality(video_path, ts) for ts in timestamps) if q]
+    if not qualities:
+        return preferred_ts, None
+
+    usable = [q for q in qualities if q["usable"]]
+    best = max(usable or qualities, key=lambda q: q["score"])
+    return float(best["timestamp"]), best
+
+
+def _local_find_worst(video_path: str, timestamps: List[float], max_clips: int) -> List[dict]:
+    candidates = []
+    for i, ts in enumerate(timestamps):
+        result = _local_score_frame(video_path, ts)
+        if result:
+            result["frame_index"] = i
+            candidates.append(result)
+
+    candidates.sort(key=lambda r: float(r.get("cinematic_score", 1.0)))
+    selected = candidates[:max_clips]
+    print(
+        f"[detect/local] found {len(candidates)} visually weak frame(s), "
+        f"keeping {len(selected)}",
+        flush=True,
+    )
+    for r in selected:
+        print(
+            f"[detect/local]   {r['timestamp']:.1f}s score={r['cinematic_score']:.2f} "
+            f"issues={r.get('issues')} — {r.get('reason', '')}",
+            flush=True,
+        )
+    return selected
 
 
 # ─── scene transition detection ─────────────────────────────────────────────
@@ -220,9 +381,9 @@ def _estimate_motion_type(video_path: str, slot_start_ts: float,
 def _gpt_video_meta(video_path: str, duration: float) -> dict:
     """Pass 1: understand what kind of video this is so downstream prompts match its style."""
     from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    client = OpenAI(api_key=config.require_openai_api_key())
 
-    n = min(META_FRAMES, max(4, int(duration / 15)))
+    n = min(META_FRAMES, max(4, int(duration / 15)), config.OPENAI_MAX_IMAGES_PER_REQUEST)
     step = duration / (n + 1)
     sample_ts = [round(step * (i + 1), 2) for i in range(n)]
 
@@ -249,6 +410,7 @@ def _gpt_video_meta(video_path: str, duration: float) -> dict:
             "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
         })
 
+    wait_for_openai_image_slot(n)
     resp = client.chat.completions.create(
         model=config.VLM_MODEL,
         messages=[{"role": "user", "content": content}],
@@ -257,11 +419,7 @@ def _gpt_video_meta(video_path: str, duration: float) -> dict:
     )
     result = parse_json(resp.choices[0].message.content, "meta")
     if not result or not isinstance(result, dict):
-        return {
-            "video_type": "general", "visual_style": "mixed",
-            "color_palette": "neutral", "subject": "mixed",
-            "lighting": "mixed", "description": "video footage",
-        }
+        return _default_video_meta()
     print(
         f"[detect/meta] type={result.get('video_type')} "
         f"style={result.get('visual_style')} "
@@ -277,13 +435,14 @@ def _gpt_find_worst(video_path: str, timestamps: List[float],
                     video_meta: dict, max_clips: int) -> List[dict]:
     """Pass 2: detect bad clips with video context. Returns up to max_clips candidates."""
     from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    client = OpenAI(api_key=config.require_openai_api_key())
 
     vtype   = video_meta.get("video_type", "general")
     palette = video_meta.get("color_palette", "neutral")
     vstyle  = video_meta.get("visual_style", "mixed")
     lighting = video_meta.get("lighting", "mixed")
 
+    timestamps = _sample_evenly(timestamps, config.OPENAI_MAX_IMAGES_PER_REQUEST)
     print(f"[detect/find] sending {len(timestamps)} frames, max_clips={max_clips}...", flush=True)
 
     content = [{
@@ -320,6 +479,7 @@ def _gpt_find_worst(video_path: str, timestamps: List[float],
             "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"},
         })
 
+    wait_for_openai_image_slot(len(timestamps))
     resp = client.chat.completions.create(
         model=config.VLM_MODEL,
         messages=[{"role": "user", "content": content}],
@@ -386,12 +546,21 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
             video_meta = cached.get("video_meta", {})
         print(f"[detect] cache hit — {len(candidates)} candidate(s)", flush=True)
     else:
-        print("[detect] Pass 1 — video context analysis...", flush=True)
-        video_meta = _gpt_video_meta(video_path, duration)
-        print(f"[detect] Pass 2 — bad clip detection (max {config.MAX_BAD_CLIPS})...",
-              flush=True)
-        candidates = _gpt_find_worst(video_path, timestamps, video_meta,
-                                     config.MAX_BAD_CLIPS)
+        if config.OPENAI_MAX_IMAGES_PER_REQUEST <= 1:
+            print(
+                "[detect] OpenAI image budget is 1/request — using local frame scoring "
+                "for detection and saving GPT vision for per-slot analysis.",
+                flush=True,
+            )
+            video_meta = _default_video_meta()
+            candidates = _local_find_worst(video_path, timestamps, config.MAX_BAD_CLIPS)
+        else:
+            print("[detect] Pass 1 — video context analysis...", flush=True)
+            video_meta = _gpt_video_meta(video_path, duration)
+            print(f"[detect] Pass 2 — bad clip detection (max {config.MAX_BAD_CLIPS})...",
+                  flush=True)
+            candidates = _gpt_find_worst(video_path, timestamps, video_meta,
+                                         config.MAX_BAD_CLIPS)
         with open(cache_file, "w") as f:
             json.dump({"candidates": candidates, "video_meta": video_meta}, f)
         print(f"[detect] cached to {cache_file}", flush=True)
@@ -414,7 +583,8 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
 
         start_frame = int(start_ts * fps)
         end_frame   = int(end_ts   * fps)
-        mid_frame   = int(ts       * fps)
+        anchor_ts, anchor_quality = _select_anchor_timestamp(video_path, start_ts, end_ts, ts)
+        mid_frame   = int(anchor_ts * fps)
 
         sid         = new_id()
         anchor_path = os.path.join(config.FRAMES, f"{sid}.png")
@@ -422,7 +592,13 @@ def find_bad_clips(video_path: str) -> Tuple[List[Slot], dict]:
         clip_path   = os.path.join(config.CLIPS,  f"{sid}_original.mp4")
 
         print(f"[detect] extracting slot {sid[:8]} at {ts:.1f}s "
-              f"({start_ts:.1f}→{end_ts:.1f}s)", flush=True)
+              f"({start_ts:.1f}→{end_ts:.1f}s), anchor={anchor_ts:.1f}s", flush=True)
+        if anchor_quality:
+            print(
+                f"[detect]   anchor quality: brightness={anchor_quality['brightness']:.2f} "
+                f"contrast={anchor_quality['contrast']:.1f} usable={anchor_quality['usable']}",
+                flush=True,
+            )
         try:
             extract_anchor(video_path, mid_frame, anchor_path, fps)
         except Exception as e:
