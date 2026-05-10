@@ -14,7 +14,7 @@ from typing import Optional
 
 from ..models.schemas import Insert
 from .. import config
-from .api_utils import retry_api, parse_json
+from .api_utils import retry_api, parse_json, wait_for_openai_image_slot
 
 
 PROMPT = """You are a senior motion picture quality-control supervisor reviewing an AI-generated replacement clip.
@@ -22,12 +22,11 @@ PROMPT = """You are a senior motion picture quality-control supervisor reviewing
 VIDEO CONTEXT: {video_type} video, {color_palette} palette, {visual_style} style
 ORIGINAL ISSUES THAT FLAGGED THIS SHOT: {issues}
 
-You will see five images:
+You may see up to four images:
   IMAGE A    — the original problem frame (low production value, flagged for replacement)
   IMAGE B1   — first quarter of the AI replacement (25% through)
   IMAGE B2   — middle of the AI replacement (50% through)
   IMAGE B3   — last quarter of the AI replacement (75% through)
-  IMAGE CMP  — A and B2 side-by-side for continuity and quality comparison
 
 Evaluate on six dimensions:
 
@@ -38,9 +37,9 @@ Evaluate on six dimensions:
                         because it is a glorified still image, not a living shot. (bool)
 3. temporal_consistent— Are B1, B2, B3 coherent — no flicker, warp, or sudden color jump? (bool)
 4. natural_looking    — Does this look like real camera footage, not AI-generated art? (bool)
-5. better_than_original — Using CMP: does B2 have HIGHER cinematic production value than A?
+5. better_than_original — Does the replacement have HIGHER cinematic production value than A?
                           Better lighting, composition, or visual interest? (bool)
-6. seamless_cut       — Using CMP: could an editor cut between A and B2 without it being
+6. seamless_cut       — Could an editor cut between A and the replacement without it being
                         jarring? Subject position, scale, and lighting continuity. (bool)
 
 Return ONLY valid JSON:
@@ -100,11 +99,38 @@ def _extract_frame_at_pct(clip_path: str, pct: float) -> str:
             os.unlink(tmp_path)
 
 
+def _local_motion_pass(gen_frames: list) -> tuple[bool, str]:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return False, "OpenCV unavailable for local motion check"
+
+    decoded = []
+    for b64 in gen_frames:
+        if not b64:
+            continue
+        data = np.frombuffer(base64.b64decode(b64), dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+        if img is not None:
+            decoded.append(cv2.resize(img, (160, 90)))
+
+    if len(decoded) < 2:
+        return False, "not enough generated frames for local motion check"
+
+    diffs = []
+    for a, b in zip(decoded, decoded[1:]):
+        diffs.append(float(np.mean(cv2.absdiff(a, b))))
+    avg_delta = sum(diffs) / len(diffs)
+    passed = avg_delta >= 3.0
+    return passed, f"local frame delta {avg_delta:.1f}"
+
+
 @retry_api(max_retries=3, base_delay=5)
 def _call_gpt(anchor_b64: str, gen_frames: list, issues_str: str,
               video_meta: dict) -> dict:
     from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    client = OpenAI(api_key=config.require_openai_api_key())
 
     vtype   = video_meta.get("video_type", "general")
     palette = video_meta.get("color_palette", "neutral")
@@ -122,32 +148,20 @@ def _call_gpt(anchor_b64: str, gen_frames: list, issues_str: str,
     content.append({"type": "image_url",
                     "image_url": {"url": f"data:image/png;base64,{anchor_b64}",
                                   "detail": "low"}})
+    image_count = 1
 
     labels = ["IMAGE B1 (replacement — first quarter):",
               "IMAGE B2 (replacement — middle):",
               "IMAGE B3 (replacement — last quarter):"]
     for label, b64 in zip(labels, gen_frames):
-        if b64:
+        if b64 and image_count < config.OPENAI_MAX_IMAGES_PER_REQUEST:
             content.append({"type": "text", "text": label})
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}",
                                           "detail": "low"}})
+            image_count += 1
 
-    # Seamless-cut comparison: original anchor + mid-clip frame side by side
-    # so GPT can judge subject position / continuity drift directly
-    mid_b64 = gen_frames[1] if len(gen_frames) > 1 and gen_frames[1] else None
-    if mid_b64:
-        content.append({"type": "text",
-                        "text": "IMAGE CMP — direct comparison for seamless_cut check:"})
-        content.append({"type": "text", "text": "Original (A):"})
-        content.append({"type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{anchor_b64}",
-                                      "detail": "low"}})
-        content.append({"type": "text", "text": "Mid-replacement (B2):"})
-        content.append({"type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{mid_b64}",
-                                      "detail": "low"}})
-
+    wait_for_openai_image_slot(image_count)
     resp = client.chat.completions.create(
         model=config.VLM_MODEL,
         messages=[{"role": "user", "content": content}],
@@ -182,15 +196,29 @@ def review(insert: Insert, anchor_path: str, issues: list,
         anchor_b64 = base64.b64encode(f.read()).decode()
 
     try:
-        d = _call_gpt(anchor_b64, gen_frames, issues_str, video_meta)
-        print(
-            f"[critic] pass={d.get('pass')} "
-            f"has_motion={d.get('has_motion')} "
-            f"better={d.get('better_than_original')} "
-            f"confidence={d.get('confidence')} "
-            f"— {d.get('notes')}",
-            flush=True,
-        )
+        if (
+            config.OPENAI_SKIP_CRITIC_WHEN_IMAGE_LIMITED
+            and config.OPENAI_MAX_IMAGES_PER_REQUEST <= 1
+        ):
+            local_pass, local_notes = _local_motion_pass(gen_frames)
+            d = {
+                "pass": local_pass,
+                "notes": (
+                    "GPT critic skipped because OPENAI_MAX_IMAGES_PER_REQUEST=1. "
+                    f"{local_notes}; review manually."
+                ),
+            }
+            print(f"[critic] skipped GPT critic — {d['notes']}", flush=True)
+        else:
+            d = _call_gpt(anchor_b64, gen_frames, issues_str, video_meta)
+            print(
+                f"[critic] pass={d.get('pass')} "
+                f"has_motion={d.get('has_motion')} "
+                f"better={d.get('better_than_original')} "
+                f"confidence={d.get('confidence')} "
+                f"— {d.get('notes')}",
+                flush=True,
+            )
     except Exception as e:
         print(f"[critic] ERROR: {e}", flush=True)
         d = {"pass": False, "notes": f"critic error: {e}"}
