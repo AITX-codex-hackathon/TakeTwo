@@ -7,8 +7,9 @@ import {
   Sparkles,
   Bot,
   Clock,
+  RotateCcw,
 } from "lucide-react";
-import { getJob, updateInsert, applyEdits, fileUrl } from "../api";
+import { getJob, retryJob, updateInsert, applyEdits, fileUrl } from "../api";
 
 const POLL_MS = 2000;
 
@@ -26,17 +27,24 @@ const STATUS_LABELS = {
 export default function Review({ jobId, onDone }) {
   const [job, setJob] = useState(null);
   const [applying, setApplying] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [notFound, setNotFound] = useState(false);
+  const [pollError, setPollError] = useState("");
   const [activeSlotId, setActiveSlotId] = useState(null);
   const [selectedInsertId, setSelectedInsertId] = useState(null);
   const convoBottomRef = useRef(null);
 
   const poll = useCallback(() => {
     getJob(jobId)
-      .then(setJob)
+      .then((nextJob) => {
+        setPollError("");
+        setJob(nextJob);
+      })
       .catch((e) => {
         if (e.status === 404 || (e.message && e.message.includes("404"))) {
           setNotFound(true);
+        } else if (e.status >= 500) {
+          setPollError("Connection hiccup while reading job status. Retrying...");
         } else {
           console.error(e);
         }
@@ -145,6 +153,16 @@ export default function Review({ jobId, onDone }) {
     }
   }
 
+  async function handleRetry() {
+    setRetrying(true);
+    try {
+      const nextJob = await retryJob(jobId);
+      setJob(nextJob);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
     <section className="editor-page">
       {/* Left: Slot list */}
@@ -168,7 +186,22 @@ export default function Review({ jobId, onDone }) {
         </div>
 
         {isError && (
-          <div className="error-message">{job.error}</div>
+          <>
+            <div className="error-message">{job.error}</div>
+            <button
+              className="btn btn-primary"
+              onClick={handleRetry}
+              disabled={retrying}
+              style={{ marginTop: 12 }}
+            >
+              <RotateCcw size={15} />
+              {retrying ? "Retrying..." : "Retry job"}
+            </button>
+          </>
+        )}
+
+        {pollError && !isError && (
+          <div className="error-message" style={{ marginTop: 12 }}>{pollError}</div>
         )}
 
         {isProcessing && (
