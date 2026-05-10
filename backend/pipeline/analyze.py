@@ -16,7 +16,7 @@ from typing import Optional
 
 from ..models.schemas import SceneContext, Slot
 from .. import config
-from .api_utils import retry_api, parse_json
+from .api_utils import retry_api, parse_json, wait_for_openai_image_slot
 
 
 # Maps video_type → camera movement language injected into prompts.
@@ -80,10 +80,10 @@ highlights, and keep the scene mood. A static replacement is a failed
 replacement. Even "still" shots must have small real-world motion: breathing,
 cloth, leaves, dust, light, reflections, or handheld drift.
 
-Frames in order:
-  FRAME A1–A6 — lead-in frames immediately before the replacement start
-  FRAME B — the anchor/problem frame where AI takes over
-  FRAME C — the next clean resume point, usually after the hard cut
+Frames, when provided:
+  FRAME A1–A6 — optional lead-in frames immediately before the replacement start
+  FRAME B — the anchor/problem frame where AI takes over (always present)
+  FRAME C — optional clean resume point, usually after the hard cut
 
 Return ONLY valid JSON:
 {{
@@ -160,7 +160,7 @@ def _transition_context(slot: Optional[Slot], fallback_motion: str) -> dict:
 
 def _cache_path(anchor_path: str) -> str:
     name = os.path.splitext(os.path.basename(anchor_path))[0]
-    return str(config.CACHE / f"analyze_v3_{name}.json")
+    return str(config.CACHE / f"analyze_v4_i{config.OPENAI_MAX_IMAGES_PER_REQUEST}_{name}.json")
 
 
 def _extract_frame_at(video_path: str, timestamp: float) -> str:
@@ -193,7 +193,7 @@ def _b64_image(path: str) -> str:
 def _call_gpt(anchor_path: str, issues: list, video_path: Optional[str],
               slot: Optional[Slot], video_meta: dict) -> dict:
     from openai import OpenAI
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    client = OpenAI(api_key=config.require_openai_api_key())
 
     vtype    = video_meta.get("video_type", "general")
     vstyle   = video_meta.get("visual_style", "mixed")
@@ -217,15 +217,18 @@ def _call_gpt(anchor_path: str, issues: list, video_path: Optional[str],
     )
 
     content = [{"type": "text", "text": prompt_text}]
+    image_budget = config.OPENAI_MAX_IMAGES_PER_REQUEST
+    image_count = 0
 
     # ── Try to add temporal context (lead-in/resume frames) ──
-    if video_path and slot and os.path.exists(video_path):
+    if image_budget > 1 and video_path and slot and os.path.exists(video_path):
         fps = slot.fps
         start_t = slot.start_frame / fps
         after_t = (slot.resume_frame + 1) / fps + 0.05
 
         lead_ts = []
-        for i in range(6):
+        max_lead_frames = max(0, image_budget - 2)  # reserve anchor + optional resume
+        for i in range(min(6, max_lead_frames)):
             ts = max(0.0, start_t - 0.9 + (i * 0.15))
             if not lead_ts or abs(ts - lead_ts[-1]) > 0.03:
                 lead_ts.append(ts)
@@ -241,8 +244,9 @@ def _call_gpt(anchor_path: str, issues: list, video_path: Optional[str],
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{b64_lead}", "detail": "low"},
                 })
+                image_count += 1
 
-        b64_after = _extract_frame_at(video_path, after_t)
+        b64_after = _extract_frame_at(video_path, after_t) if image_count < image_budget - 1 else None
     else:
         b64_after  = None
 
@@ -251,13 +255,16 @@ def _call_gpt(anchor_path: str, issues: list, video_path: Optional[str],
     content.append({"type": "image_url",
                     "image_url": {"url": f"data:image/png;base64,{_b64_image(anchor_path)}",
                                   "detail": "high"}})
+    image_count += 1
 
-    if video_path and slot and b64_after:
+    if video_path and slot and b64_after and image_count < image_budget:
         content.append({"type": "text", "text": "FRAME C (clean resume point after AI handover):"})
         content.append({"type": "image_url",
                          "image_url": {"url": f"data:image/jpeg;base64,{b64_after}",
                                        "detail": "low"}})
+        image_count += 1
 
+    wait_for_openai_image_slot(image_count)
     resp = client.chat.completions.create(
         model=config.VLM_MODEL,
         messages=[{"role": "user", "content": content}],
