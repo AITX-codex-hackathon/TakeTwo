@@ -5,6 +5,11 @@ import re
 import json
 import time
 import functools
+import threading
+
+
+_OPENAI_IMAGE_LOCK = threading.Lock()
+_LAST_OPENAI_IMAGE_CALL_TS = 0.0
 
 
 def retry_api(max_retries: int = 3, base_delay: float = 5.0):
@@ -33,6 +38,31 @@ def retry_api(max_retries: int = 3, base_delay: float = 5.0):
                     time.sleep(delay)
         return wrapper
     return decorator
+
+
+def wait_for_openai_image_slot(image_count: int):
+    """Throttle vision requests for projects with low OpenAI image-per-minute limits."""
+    if image_count <= 0:
+        return
+
+    from .. import config
+
+    min_interval = max(0.0, config.OPENAI_IMAGE_MIN_INTERVAL_SEC)
+    if min_interval <= 0:
+        return
+
+    global _LAST_OPENAI_IMAGE_CALL_TS
+    with _OPENAI_IMAGE_LOCK:
+        now = time.time()
+        wait_s = (_LAST_OPENAI_IMAGE_CALL_TS + min_interval) - now
+        if wait_s > 0:
+            print(
+                f"[api] waiting {wait_s:.0f}s for OpenAI image rate limit "
+                f"({image_count} image{'s' if image_count != 1 else ''})",
+                flush=True,
+            )
+            time.sleep(wait_s)
+        _LAST_OPENAI_IMAGE_CALL_TS = time.time()
 
 
 def parse_json(text: str, context: str = "") -> any:
