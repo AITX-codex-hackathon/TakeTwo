@@ -179,19 +179,35 @@ def _process(job_id: str):
         job.status = "generating"
         jobs.save(job)
 
+        generated_slots = slots[:min(n, config.FAL_MAX_GENERATED_SLOTS)]
+        if len(generated_slots) < n:
+            _log(job, "angel",
+                 f"Generating replacements for the first {len(generated_slots)}/{n} clips "
+                 f"because FAL_MAX_GENERATED_SLOTS={config.FAL_MAX_GENERATED_SLOTS}.")
+
         def _gen_one(slot, i):
             ctx = slot_contexts[slot.id]
             return _process_slot(job, slot, ctx, i, n)
 
-        if n == 1:
-            all_inserts = _gen_one(slots[0], 1)
+        if len(generated_slots) == 1:
+            all_inserts = _gen_one(generated_slots[0], 1)
+            job.inserts = all_inserts
+            jobs.save(job)
         else:
             all_inserts = []
-            with ThreadPoolExecutor(max_workers=min(n, 2)) as pool:
+            max_workers = min(len(generated_slots), config.FAL_CONCURRENCY)
+            print(
+                f"[job {job_id[:8]}] generating {len(generated_slots)} slot(s) "
+                f"with max_workers={max_workers}, fal_concurrency={config.FAL_CONCURRENCY}",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(_gen_one, slot, i + 1): slot
-                           for i, slot in enumerate(slots)}
+                           for i, slot in enumerate(generated_slots)}
                 for fut in as_completed(futures):
                     all_inserts.extend(fut.result())
+                    job.inserts = all_inserts
+                    jobs.save(job)
 
         job.inserts = all_inserts
         job.status  = "review"
@@ -214,6 +230,21 @@ def _process(job_id: str):
 
 # ─── routes ─────────────────────────────────────────────────────────────────
 
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "vlm_model": config.VLM_MODEL,
+        "openai_max_images_per_request": config.OPENAI_MAX_IMAGES_PER_REQUEST,
+        "openai_image_min_interval_sec": config.OPENAI_IMAGE_MIN_INTERVAL_SEC,
+        "openai_skip_critic_when_image_limited": config.OPENAI_SKIP_CRITIC_WHEN_IMAGE_LIMITED,
+        "i2v_provider": config.I2V_PROVIDER,
+        "fal_generations_per_slot": config.FAL_GENERATIONS_PER_SLOT,
+        "fal_max_generated_slots": config.FAL_MAX_GENERATED_SLOTS,
+        "fal_concurrency": config.FAL_CONCURRENCY,
+    })
+
+
 @app.post("/jobs")
 def create_job():
     if "video" not in request.files:
@@ -233,6 +264,26 @@ def get_job(jid):
     job = jobs.get(jid)
     if not job:
         abort(404)
+    return jsonify(job.to_dict())
+
+
+@app.post("/jobs/<jid>/retry")
+def retry_job(jid):
+    job = jobs.get(jid)
+    if not job:
+        abort(404)
+    if not os.path.exists(job.source_path):
+        return jsonify({"error": "source video is missing; re-upload the video"}), 400
+
+    job.status = "queued"
+    job.error = None
+    job.slots = []
+    job.inserts = []
+    job.output_path = None
+    job.video_meta = {}
+    job.logs = []
+    jobs.save(job)
+    threading.Thread(target=_process, args=(jid,), daemon=True).start()
     return jsonify(job.to_dict())
 
 
