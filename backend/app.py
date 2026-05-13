@@ -1,24 +1,29 @@
 """
 TakeTwo API — AI Video Editor
 Routes:
-  POST /jobs                           upload video, kick off detection
-  GET  /jobs/<id>                      job status + slots + inserts
+  POST /jobs                           upload video, kick off pipeline
+  GET  /jobs/<id>                      job status + slots + inserts + logs
   POST /jobs/<id>/inserts/<iid>        {status: approved|rejected|cut}
   POST /jobs/<id>/apply                stitch final video
   GET  /jobs/<id>/file/<kind>/<name>   serve anchor/clip/output files
 """
 import os
 import sys
+import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Allow running as `python app.py` from inside the backend directory
+# Cap simultaneous GPT vision calls: 5 slots × 3 frames each = 15 images at once
+# without this — guaranteed 429 storm. Semaphore keeps it at ≤3 in-flight.
+_API_SEMAPHORE = threading.Semaphore(3)
+
 if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flask import Flask, request, jsonify, send_file, abort
 from flask_cors import CORS
 from backend import config, jobs
-from backend.models.schemas import Job, new_id
+from backend.models.schemas import Job, Insert, new_id
 from backend.pipeline import detect, analyze, generate, critic, splice
 
 app = Flask(__name__)
@@ -27,10 +32,74 @@ CORS(app)
 jobs.load_all()
 
 
-def _log(job, agent: str, msg: str):
-    import time
+# ─── logging ────────────────────────────────────────────────────────────────
+
+def _log(job: Job, agent: str, msg: str):
     job.logs.append({"agent": agent, "msg": msg, "ts": time.time()})
     jobs.save(job)
+
+
+# ─── pipeline ───────────────────────────────────────────────────────────────
+
+def _process_slot(job: Job, slot, ctx, idx: int, total: int) -> list:
+    """
+    Run generate + critic for a single slot.
+    Returns a list of Insert objects.
+    Thread-safe: does not mutate job directly.
+    """
+    inserts = []
+    vtype   = job.video_meta.get("video_type", "general")
+    palette = job.video_meta.get("color_palette", "neutral")
+
+    if ctx.recommendation == "cut":
+        _log(job, "angel",
+             f"Clip {idx}/{total} is beyond saving — flagging for removal. "
+             "Sometimes less is more.")
+        inserts.append(Insert(
+            id=new_id(), slot_id=slot.id, clip_path="", prompt="",
+            label="AI recommends cutting this clip", status="pending",
+        ))
+        return inserts
+
+    _log(job, "angel",
+         f"Generating cinematic replacement for clip {idx}/{total} — "
+         f"{vtype} style, {palette} tones, ARRI-quality footage. "
+         "This takes ~2–3 min per clip ⏳")
+
+    if slot.replace_end_frame != -1 and slot.replace_end_frame != slot.end_frame:
+        _log(job, "angel",
+             f"I'm taking over the scene until the next clean cut "
+             f"({slot.replacement_duration_sec:.1f}s total) so the splice lands on a hard edit, "
+             "not a shaky-to-smooth glitch.")
+    elif getattr(slot, "resume_frame_path", ""):
+        _log(job, "angel",
+             "No nearby hard cut, so I'm using the resume frame as an outro target "
+             "to match back into the original shot cleanly.")
+
+    raw_inserts = generate.generate_for_slot(slot, ctx, video_meta=job.video_meta)
+
+    for ins in raw_inserts:
+        try:
+            _log(job, "devil",
+                 f"My turn 😈 — reviewing replacement {ins.label[:60]}...")
+            with _API_SEMAPHORE:
+                critic.review(ins, slot.anchor_frame_path, slot.issues,
+                              video_meta=job.video_meta)
+            if ins.critic_pass:
+                _log(job, "devil",
+                     f"Fine… I'll admit this one passes ✅ — "
+                     f"{ins.critic_notes or 'looks consistent with the original.'}")
+            else:
+                _log(job, "devil",
+                     f"Flagging this one ❌ — "
+                     f"{ins.critic_notes or 'does not match the scene well enough.'}")
+        except Exception as e:
+            ins.critic_notes = f"critic error: {e}"
+            _log(job, "devil", f"Something went wrong during my review: {e}")
+
+        inserts.append(ins)
+
+    return inserts
 
 
 def _process(job_id: str):
@@ -38,72 +107,120 @@ def _process(job_id: str):
     if not job:
         return
     try:
+        # ── Stage 1: Detect ──────────────────────────────────────────────
         print(f"[job {job_id[:8]}] stage=detecting", flush=True)
         job.status = "detecting"
-        _log(job, "angel", "I'm scanning your footage frame by frame, hunting for blurry shots, awkward pauses, and visual quality issues...")
-        job.slots = detect.find_bad_clips(job.source_path)
-        n = len(job.slots)
-        print(f"[job {job_id[:8]}] detected {n} slot(s)", flush=True)
+        _log(job, "angel",
+             "I'm scanning your footage frame by frame — hunting for blurry shots, "
+             "awkward pauses, and visual quality issues...")
 
-        if not job.slots:
-            _log(job, "angel", "Great news — I scanned every frame and your footage looks clean! No bad clips detected.")
+        slots, video_meta = detect.find_bad_clips(job.source_path)
+        job.slots      = slots
+        job.video_meta = video_meta
+        jobs.save(job)
+
+        vtype = video_meta.get("video_type", "general")
+        palette = video_meta.get("color_palette", "neutral")
+        print(f"[job {job_id[:8]}] detected {len(slots)} slot(s), "
+              f"video_type={vtype}", flush=True)
+
+        if not slots:
+            _log(job, "angel",
+                 "Great news — I scanned every frame and your footage looks clean! "
+                 "No bad clips detected.")
             job.status = "review"
             jobs.save(job)
             return
 
-        _log(job, "angel", f"Found {n} clip{'s' if n != 1 else ''} that need attention. Let me dig deeper into each one...")
+        n = len(slots)
+        _log(job, "angel",
+             f"Found {n} clip{'s' if n != 1 else ''} that need attention. "
+             f"This looks like a {vtype} video with {palette} tones — "
+             "I'll tailor all replacements to match your style.")
 
+        # ── Stage 2: Analyze (parallel for multiple slots) ───────────────
         job.status = "analyzing"
         jobs.save(job)
         slot_contexts = {}
-        for i, slot in enumerate(job.slots):
-            print(f"[job {job_id[:8]}] analyzing slot {i+1}/{len(job.slots)}", flush=True)
-            issues_str = ", ".join(slot.issues) if slot.issues else "quality issues"
-            _log(job, "angel", f"Examining clip {i+1}/{n} ({issues_str})... reading the scene composition and emotional tone.")
-            ctx = analyze.analyze_anchor(slot.anchor_frame_path, slot.issues)
-            print(f"[job {job_id[:8]}] -> recommendation={ctx.recommendation} mood={ctx.mood}", flush=True)
-            _log(job, "angel", f"Analysis done. Mood: {ctx.mood}. My recommendation: {'replace with something better ✨' if ctx.recommendation == 'replace' else 'cut this clip entirely ✂️'}.")
-            slot_contexts[slot.id] = ctx
 
+        def _analyze_one(slot, i):
+            issues_str = ", ".join(slot.issues) if slot.issues else "quality issues"
+            _log(job, "angel",
+                 f"Examining clip {i}/{n} ({issues_str}) — reading scene "
+                 "composition, temporal context, and emotional tone.")
+            with _API_SEMAPHORE:
+                ctx = analyze.analyze_anchor(
+                    slot.anchor_frame_path,
+                    slot.issues,
+                    video_path=job.source_path,
+                    slot=slot,
+                    video_meta=job.video_meta,
+                )
+            _log(job, "angel",
+                 f"Analysis done for clip {i}. Mood: {ctx.mood}. "
+                 f"Recommendation: "
+                 f"{'replace with something better ✨' if ctx.recommendation == 'replace' else 'cut this clip ✂️'}.")
+            print(f"[job {job_id[:8]}] slot {slot.id[:8]}: "
+                  f"rec={ctx.recommendation} mood={ctx.mood}", flush=True)
+            return slot.id, ctx
+
+        if n == 1:
+            sid, ctx = _analyze_one(slots[0], 1)
+            slot_contexts[sid] = ctx
+        else:
+            with ThreadPoolExecutor(max_workers=min(n, 3)) as pool:
+                futures = {pool.submit(_analyze_one, slot, i + 1): slot
+                           for i, slot in enumerate(slots)}
+                for fut in as_completed(futures):
+                    sid, ctx = fut.result()
+                    slot_contexts[sid] = ctx
+
+        # ── Stage 3: Generate + Critic (parallel for multiple slots) ─────
         job.status = "generating"
         jobs.save(job)
-        from backend.models.schemas import Insert
-        for i, slot in enumerate(job.slots):
+
+        generated_slots = slots[:min(n, config.FAL_MAX_GENERATED_SLOTS)]
+        if len(generated_slots) < n:
+            _log(job, "angel",
+                 f"Generating replacements for the first {len(generated_slots)}/{n} clips "
+                 f"because FAL_MAX_GENERATED_SLOTS={config.FAL_MAX_GENERATED_SLOTS}.")
+
+        def _gen_one(slot, i):
             ctx = slot_contexts[slot.id]
-            print(f"[job {job_id[:8]}] generating slot {i+1}/{len(job.slots)} ({ctx.recommendation})", flush=True)
-            if ctx.recommendation == "cut":
-                _log(job, "angel", f"Clip {i+1} is beyond saving — I'm flagging it for removal. Sometimes less is more.")
-                job.inserts.append(Insert(
-                    id=new_id(), slot_id=slot.id, clip_path="", prompt="",
-                    label="AI recommends cutting this clip", status="pending",
-                ))
-                jobs.save(job)
-                continue
+            return _process_slot(job, slot, ctx, i, n)
 
-            _log(job, "angel", f"Generating cinematic replacement for clip {i+1}... photorealistic 4K, ARRI camera style, smooth motion. This takes ~2–3 minutes per clip ⏳")
-            inserts = generate.generate_for_slot(slot, ctx)
-            for ins in inserts:
-                try:
-                    _log(job, "devil", f"My turn 😈 Let me see if this replacement actually fits the original scene...")
-                    critic.review(ins, slot.anchor_frame_path, slot.issues)
-                    print(f"[job {job_id[:8]}] critic pass={ins.critic_pass}: {ins.critic_notes}", flush=True)
-                    if ins.critic_pass:
-                        _log(job, "devil", f"Fine... I'll admit it — this one passes. {ins.critic_notes or 'Looks consistent with the original.'} ✅")
-                    else:
-                        _log(job, "devil", f"Nice try, but I'm flagging this one ❌ — {ins.critic_notes or 'does not match the scene well enough.'}")
-                except Exception as e:
-                    ins.critic_notes = f"critic error: {e}"
-                    _log(job, "devil", f"Something went wrong during my review: {e}")
-                job.inserts.append(ins)
+        if len(generated_slots) == 1:
+            all_inserts = _gen_one(generated_slots[0], 1)
+            job.inserts = all_inserts
             jobs.save(job)
+        else:
+            all_inserts = []
+            max_workers = min(len(generated_slots), config.FAL_CONCURRENCY)
+            print(
+                f"[job {job_id[:8]}] generating {len(generated_slots)} slot(s) "
+                f"with max_workers={max_workers}, fal_concurrency={config.FAL_CONCURRENCY}",
+                flush=True,
+            )
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_gen_one, slot, i + 1): slot
+                           for i, slot in enumerate(generated_slots)}
+                for fut in as_completed(futures):
+                    all_inserts.extend(fut.result())
+                    job.inserts = all_inserts
+                    jobs.save(job)
 
-        job.status = "review"
+        job.inserts = all_inserts
+        job.status  = "review"
         jobs.save(job)
-        _log(job, "angel", f"All done! 🎬 {len(job.inserts)} replacement option(s) are ready. Head to the review panel to make your decisions.")
-        print(f"[job {job_id[:8]}] done — {len(job.inserts)} insert(s) ready", flush=True)
+
+        _log(job, "angel",
+             f"All done! 🎬 {len(all_inserts)} replacement option(s) ready. "
+             "Head to the review panel to make your decisions.")
+        print(f"[job {job_id[:8]}] done — {len(all_inserts)} insert(s)", flush=True)
+
     except Exception as e:
         job.status = "error"
-        job.error = str(e)
+        job.error  = str(e)
         _log(job, "devil", f"Something broke in the pipeline 💀 — {str(e)}")
         jobs.save(job)
         import traceback
@@ -111,11 +228,28 @@ def _process(job_id: str):
         traceback.print_exc()
 
 
+# ─── routes ─────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "vlm_model": config.VLM_MODEL,
+        "openai_max_images_per_request": config.OPENAI_MAX_IMAGES_PER_REQUEST,
+        "openai_image_min_interval_sec": config.OPENAI_IMAGE_MIN_INTERVAL_SEC,
+        "openai_skip_critic_when_image_limited": config.OPENAI_SKIP_CRITIC_WHEN_IMAGE_LIMITED,
+        "i2v_provider": config.I2V_PROVIDER,
+        "fal_generations_per_slot": config.FAL_GENERATIONS_PER_SLOT,
+        "fal_max_generated_slots": config.FAL_MAX_GENERATED_SLOTS,
+        "fal_concurrency": config.FAL_CONCURRENCY,
+    })
+
+
 @app.post("/jobs")
 def create_job():
     if "video" not in request.files:
         return jsonify({"error": "no video file"}), 400
-    f = request.files["video"]
+    f   = request.files["video"]
     jid = new_id()
     src_path = os.path.join(config.UPLOADS, f"{jid}_{f.filename}")
     f.save(src_path)
@@ -133,6 +267,26 @@ def get_job(jid):
     return jsonify(job.to_dict())
 
 
+@app.post("/jobs/<jid>/retry")
+def retry_job(jid):
+    job = jobs.get(jid)
+    if not job:
+        abort(404)
+    if not os.path.exists(job.source_path):
+        return jsonify({"error": "source video is missing; re-upload the video"}), 400
+
+    job.status = "queued"
+    job.error = None
+    job.slots = []
+    job.inserts = []
+    job.output_path = None
+    job.video_meta = {}
+    job.logs = []
+    jobs.save(job)
+    threading.Thread(target=_process, args=(jid,), daemon=True).start()
+    return jsonify(job.to_dict())
+
+
 @app.post("/jobs/<jid>/inserts/<iid>")
 def update_insert(jid, iid):
     job = jobs.get(jid)
@@ -144,6 +298,7 @@ def update_insert(jid, iid):
     for ins in job.inserts:
         if ins.id == iid:
             ins.status = new_status
+            jobs.save(job)
             return jsonify({"ok": True})
     abort(404)
 
@@ -154,13 +309,16 @@ def apply_edits(jid):
     if not job:
         abort(404)
     job.status = "applying"
+    jobs.save(job)
     try:
         out = splice.apply_decisions(job)
         job.status = "done"
+        jobs.save(job)
         return jsonify({"output": out})
     except Exception as e:
         job.status = "error"
-        job.error = str(e)
+        job.error  = str(e)
+        jobs.save(job)
         return jsonify({"error": str(e)}), 500
 
 
@@ -168,7 +326,7 @@ def apply_edits(jid):
 def serve_file(jid, kind, name):
     base = {
         "anchor": str(config.FRAMES),
-        "clip": str(config.CLIPS),
+        "clip":   str(config.CLIPS),
         "output": str(config.OUTPUTS),
     }.get(kind)
     if not base:

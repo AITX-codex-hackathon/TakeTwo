@@ -7,8 +7,9 @@ import {
   Sparkles,
   Bot,
   Clock,
+  RotateCcw,
 } from "lucide-react";
-import { getJob, updateInsert, applyEdits, fileUrl } from "../api";
+import { getJob, retryJob, updateInsert, applyEdits, fileUrl } from "../api";
 
 const POLL_MS = 2000;
 
@@ -26,17 +27,24 @@ const STATUS_LABELS = {
 export default function Review({ jobId, onDone, onReset }) {
   const [job, setJob] = useState(null);
   const [applying, setApplying] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [notFound, setNotFound] = useState(false);
+  const [pollError, setPollError] = useState("");
   const [activeSlotId, setActiveSlotId] = useState(null);
   const [selectedInsertId, setSelectedInsertId] = useState(null);
   const convoBottomRef = useRef(null);
 
   const poll = useCallback(() => {
     getJob(jobId)
-      .then(setJob)
+      .then((nextJob) => {
+        setPollError("");
+        setJob(nextJob);
+      })
       .catch((e) => {
         if (e.status === 404 || (e.message && e.message.includes("404"))) {
           setNotFound(true);
+        } else if (e.status >= 500) {
+          setPollError("Connection hiccup while reading job status. Retrying...");
         } else {
           console.error(e);
         }
@@ -103,6 +111,7 @@ export default function Review({ jobId, onDone, onReset }) {
 
   const activeSlot = slots.find((s) => s.id === activeSlotId);
   const activeInserts = activeSlot ? (slotInserts[activeSlot.id] || []) : [];
+  const generatedInserts = activeInserts.filter((i) => i.clip_path);
   const selectedInsert = activeInserts.find((i) => i.id === selectedInsertId);
   const slotHasDecision = activeSlot
     ? activeInserts.some((i) => i.status === "approved" || i.status === "cut")
@@ -145,6 +154,16 @@ export default function Review({ jobId, onDone, onReset }) {
     }
   }
 
+  async function handleRetry() {
+    setRetrying(true);
+    try {
+      const nextJob = await retryJob(jobId);
+      setJob(nextJob);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
   return (
     <section className="editor-page">
       {/* Left: Slot list */}
@@ -168,12 +187,22 @@ export default function Review({ jobId, onDone, onReset }) {
         </div>
 
         {isError && (
-          <div className="error-message" style={{ display: "flex", flexDirection: "column", gap: "10px", alignItems: "center" }}>
-            {job.error}
-            <button className="btn btn-primary" onClick={onReset} style={{ padding: "8px 16px", fontSize: 14 }}>
-              Re-upload Video
+          <>
+            <div className="error-message">{job.error}</div>
+            <button
+              className="btn btn-primary"
+              onClick={handleRetry}
+              disabled={retrying}
+              style={{ marginTop: 12 }}
+            >
+              <RotateCcw size={15} />
+              {retrying ? "Retrying..." : "Retry job"}
             </button>
-          </div>
+          </>
+        )}
+
+        {pollError && !isError && (
+          <div className="error-message" style={{ marginTop: 12 }}>{pollError}</div>
         )}
 
         {isProcessing && (
@@ -202,7 +231,8 @@ export default function Review({ jobId, onDone, onReset }) {
               const inserts = slotInserts[slot.id] || [];
               const decided = inserts.some((i) => i.status === "approved" || i.status === "cut");
               const startSec = (slot.start_frame / slot.fps).toFixed(1);
-              const endSec = (slot.end_frame / slot.fps).toFixed(1);
+              const resumeFrame = slot.replace_end_frame !== -1 ? slot.replace_end_frame : slot.end_frame;
+              const endSec = (resumeFrame / slot.fps).toFixed(1);
               return (
                 <article
                   key={slot.id}
@@ -258,7 +288,7 @@ export default function Review({ jobId, onDone, onReset }) {
           {activeSlot && !isProcessing && (
             <span>
               {(activeSlot.start_frame / activeSlot.fps).toFixed(1)}s –{" "}
-              {(activeSlot.end_frame / activeSlot.fps).toFixed(1)}s
+              {((activeSlot.replace_end_frame !== -1 ? activeSlot.replace_end_frame : activeSlot.end_frame) / activeSlot.fps).toFixed(1)}s
             </span>
           )}
         </div>
@@ -385,11 +415,11 @@ export default function Review({ jobId, onDone, onReset }) {
           )}
         </div>
 
-        {activeInserts.filter((i) => i.clip_path).length > 0 && (
+        {generatedInserts.length > 0 && (
           <>
             <div style={{ fontSize: 13, color: "#6B7280", fontWeight: 600 }}>Replacement options:</div>
             <div className="source-list" style={{ maxHeight: 280 }}>
-              {activeInserts.filter((i) => i.clip_path).map((ins) => (
+              {generatedInserts.map((ins) => (
                 <article
                   key={ins.id}
                   className={`source-card ${selectedInsertId === ins.id ? "active" : ""}`}

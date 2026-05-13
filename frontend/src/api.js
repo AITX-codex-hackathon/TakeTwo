@@ -10,10 +10,22 @@ export async function uploadVideo(file) {
 export async function getJob(jobId) {
   const res = await fetch(`${BASE}/jobs/${jobId}`);
   if (!res.ok) {
-    const err = new Error(`${res.status}`);
+    let message = `${res.status}`;
+    try {
+      const text = await res.text();
+      if (text) message = `${res.status}: ${text.slice(0, 240)}`;
+    } catch {
+      // Keep the status-only message when the response body is unavailable.
+    }
+    const err = new Error(message);
     err.status = res.status;
     throw err;
   }
+  return res.json();
+}
+
+export async function retryJob(jobId) {
+  const res = await fetch(`${BASE}/jobs/${jobId}/retry`, { method: "POST" });
   return res.json();
 }
 
